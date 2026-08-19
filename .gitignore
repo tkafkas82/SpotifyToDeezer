@@ -6,3 +6,4 @@ data/cache.json
 data/browser/
 server.out
 server.err
+data/gw.json

@@ -4,9 +4,10 @@ Copies a Spotify playlist into Deezer. Paste a playlist link, watch every track 
 matched against the Deezer catalogue, fix or drop the doubtful ones, then write the
 result into a new or existing Deezer playlist.
 
-**No API keys, no app registrations.** The only thing it needs from you is a Deezer
-login, once, in a browser window it opens itself — writing to your library needs
-proof it is you, and that login is the proof.
+**No API keys, no app registrations.** The one thing it needs from you is proof that
+your Deezer account is yours: paste your `arl` session cookie once (four clicks in
+devtools, instructions in the app). Everything else — reading the Spotify playlist,
+searching Deezer, matching — needs nothing at all.
 
 Everything runs on this machine. Nothing is sent anywhere except to Spotify's and
 Deezer's own servers.
@@ -21,25 +22,22 @@ npm run probe             # match a sample track list against live Deezer
 ## First run
 
 1. `start.bat`
-2. Click **Connect Deezer**. A Chrome window opens on Deezer's login page — log in
-   there with **email and password**; Google/Facebook sign-in often refuses a browser
-   it can tell is automated. The page notices the login by itself and closes the
-   window; the session is remembered in `data/browser/` and every later check or
-   write reuses it headlessly, with nothing appearing on screen.
+2. **Connect Deezer with your session cookie.** In your *normal* browser, signed in to
+   deezer.com: `F12` → **Application** → **Cookies** → `https://www.deezer.com` → copy
+   the value of `arl` (a long string, ~190 characters) and paste it into the box on the
+   page. It is validated against Deezer before it is kept, and stored only in
+   `data/gw.json` on this machine. That cookie *is* your Deezer session — treat it like
+   a password.
 3. Paste a Spotify playlist link, **Match tracks**, tick what you want, **Add to Deezer**.
 
-If the login window keeps bouncing back to the sign-in form, use the `arl` cookie
-below instead — no window is involved at all.
+Why the cookie and not a login form: Deezer will not complete a sign-in inside an
+automated browser. Tested with a real click on its Log in button — the page simply
+re-renders with no error message at all, and its Google/Facebook buttons never finish
+loading. The **try browser login** button is still there and opens a real Chrome window
+in case that ever changes, but the cookie is the route that works.
 
-Chrome or Edge is used if installed, so nothing is downloaded. If neither is there,
-`npx playwright install chromium` provides one.
-
-### Optional: skip the browser window
-
-Paste the `arl` cookie from a logged-in deezer.com (DevTools → Application →
-Cookies → `arl`) into `.env` as `DEEZER_ARL=...` and the writes go straight through
-Node with no window at all. That cookie *is* your Deezer session — treat it like a
-password.
+The other supported route is a registered Deezer app (`.env`), which uses the
+documented OAuth API — see below.
 
 ### Optional: API keys
 
@@ -70,9 +68,9 @@ stays on ordinary public pages.
 **Writing Deezer.** `gw-light.php` is the gateway Deezer's own website calls. It
 authenticates with the normal web-session cookie plus a CSRF token (`checkForm`)
 instead of an OAuth app, so `playlist.create` and `playlist.addSongs` work as you.
-Two ways in, same calls: through the logged-in browser profile's cookie jar (the
-cookies never have to leave the browser, and no tab is used), or plain Node with the
-`arl` cookie.
+Two ways in, same calls: plain Node carrying the pasted `arl` cookie (the route that
+works), or the cookie jar of a browser profile logged in through the **try browser
+login** window (the route Deezer's bot defences currently close off).
 
 Being undocumented, that gateway can change without notice — `lib/deezer.js` (the
 registered-app path) is the stable route, `lib/deezer-gw.js` the no-setup one.

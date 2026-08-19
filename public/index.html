@@ -12,6 +12,7 @@
 <header>
   <h1><span class="sp">Spotify</span> <span class="arrow">&rarr;</span> <span class="dz">Deezer</span></h1>
   <div id="account" class="account"></div>
+  <span id="build" class="build"></span>
 </header>
 
 <main>
@@ -25,6 +26,28 @@
     <p class="hint" id="source-hint">
       Public playlists only. Spotify&rsquo;s own editorial and &ldquo;Made for you&rdquo; playlists
       (Discover Weekly, Release Radar) are not readable by third-party apps.
+    </p>
+  </section>
+
+  <section class="card hidden" id="arl-card">
+    <label for="arl">Connect Deezer &mdash; paste your session cookie</label>
+    <div class="row">
+      <input id="arl" type="password" spellcheck="false" autocomplete="off"
+             placeholder="paste the arl cookie of a logged-in deezer.com">
+      <button id="arl-save" class="primary">Connect</button>
+    </div>
+    <p class="hint">
+      In your <em>normal</em> browser, signed in to deezer.com: press <code>F12</code> &rarr;
+      <b>Application</b> &rarr; <b>Cookies</b> &rarr; <code>https://www.deezer.com</code> &rarr; copy the
+      value of <code>arl</code> (a long string, ~190 characters) and paste it here. It is checked
+      against Deezer before being kept, and stored only in <code>data/gw.json</code> on this machine.
+      It <em>is</em> your Deezer session &mdash; treat it like a password.
+    </p>
+    <p class="hint">
+      Deezer will not complete a login inside an automated browser &mdash; its form silently
+      re-renders instead of signing you in &mdash; so the <b>Connect Deezer</b> button up there is
+      a long shot. This cookie is the reliable way in. App credentials in <code>.env</code> also work
+      if you would rather register an app.
     </p>
   </section>
 

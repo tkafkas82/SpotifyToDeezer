@@ -16,6 +16,7 @@
  */
 import express from 'express';
 import crypto from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { HttpError } from './lib/http.js';
@@ -32,8 +33,33 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 4870;
 const DEEZER_HOME = 'https://www.deezer.com/';
 
+/**
+ * Which commit is running. Printed at startup and served in /api/config, because
+ * "restart the server" and "the fix did not work" look identical otherwise.
+ */
+const BUILD = (() => {
+  try {
+    const head = fs.readFileSync(path.join(HERE, '.git', 'HEAD'), 'utf8').trim();
+    const ref = head.startsWith('ref: ') ? head.slice(5) : null;
+    const hash = ref ? fs.readFileSync(path.join(HERE, '.git', ref), 'utf8').trim() : head;
+    return hash.slice(0, 7);
+  } catch {
+    return 'unknown';
+  }
+})();
+
 const app = express();
 app.use(express.json({ limit: '4mb' }));
+
+// --- the pasted-cookie shortcut ------------------------------------------
+
+const GW_FILE = path.join(HERE, 'data', 'gw.json');
+let storedArl = null;
+try {
+  storedArl = JSON.parse(fs.readFileSync(GW_FILE, 'utf8')).arl || null;
+} catch { /* nothing saved */ }
+
+const arl = () => process.env.DEEZER_ARL || storedArl;
 
 const pendingStates = new Set();
 
@@ -45,12 +71,12 @@ const fail = (res, err) => {
 
 // --- the two Deezer session flavours -------------------------------------
 
-// Cookie transport when an `arl` is pasted in .env, otherwise the browser profile.
+// Cookie transport whenever an `arl` is available, otherwise the browser profile.
 let gw = null;
 function gwClient() {
   if (!gw) {
-    gw = process.env.DEEZER_ARL
-      ? new GwClient(cookieTransport(process.env.DEEZER_ARL))
+    gw = arl()
+      ? new GwClient(cookieTransport(arl()))
       : new GwClient(browserTransport(() => browser.requestApi()));
   }
   return gw;
@@ -64,7 +90,7 @@ function gwClient() {
  * ask, so a first-time visitor never triggers a browser launch.
  */
 async function sessionUser({ mayOpen = false } = {}) {
-  const usable = process.env.DEEZER_ARL || browser.sessionOpen() || (mayOpen && browser.profileExists());
+  const usable = arl() || browser.sessionOpen() || (mayOpen && browser.profileExists());
   if (!usable) return null;
   try {
     return await gwClient().refresh();
@@ -74,7 +100,7 @@ async function sessionUser({ mayOpen = false } = {}) {
 }
 
 const gwWriter = client => ({
-  mode: process.env.DEEZER_ARL ? 'arl' : 'browser',
+  mode: arl() ? 'arl' : 'browser',
   myPlaylists: () => client.myPlaylists(),
   createPlaylist: (title, description) => client.createPlaylist(title, description),
   playlistTrackIds: id => client.playlistTrackIds(id),
@@ -103,8 +129,8 @@ const apiWriter = () => ({
 async function resolveWriter() {
   if (deezerApi.configured() && await deezerApi.currentUser()) return apiWriter();
   if (await sessionUser({ mayOpen: true })) return gwWriter(gwClient());
-  throw new HttpError(401, process.env.DEEZER_ARL
-    ? 'That DEEZER_ARL cookie is not a logged-in Deezer session any more - grab a fresh one.'
+  throw new HttpError(401, arl()
+    ? 'That Deezer cookie is not a logged-in session any more - paste a fresh one.'
     : 'Connect Deezer first (a browser window opens; log in there once).');
 }
 
@@ -124,13 +150,14 @@ app.get('/api/config', async (req, res) => {
         hasKeys: deezerApi.configured(),
         oauthUser: deezerApi.configured() ? await deezerApi.currentUser() : null,
         sessionUser: user,
-        sessionMode: process.env.DEEZER_ARL ? 'arl' : 'browser',
+        sessionMode: arl() ? 'arl' : 'browser',
         sessionOpen: browser.sessionOpen(),
         hasProfile: browser.profileExists(),
         browserChannel: browser.pickChannel() || 'chromium',
       },
       redirectUri: deezerApi.redirectUri(PORT),
       cacheSize: cache.size,
+      build: BUILD,
     });
   } catch (err) { fail(res, err); }
 });
@@ -139,9 +166,9 @@ app.get('/api/config', async (req, res) => {
 
 app.post('/api/deezer/session/open', async (req, res) => {
   try {
-    if (process.env.DEEZER_ARL) {
+    if (arl()) {
       const user = await sessionUser({ mayOpen: true });
-      if (!user) throw new HttpError(401, 'That DEEZER_ARL cookie is not logged in.');
+      if (!user) throw new HttpError(401, 'That Deezer cookie is not logged in.');
       return res.json({ user, opened: false });
     }
     // A stored login answers for itself headlessly; only a missing one is worth
@@ -161,6 +188,34 @@ app.get('/api/deezer/session/check', async (req, res) => {
   } catch (err) { fail(res, err); }
 });
 
+/**
+ * The escape hatch from the login window: paste the `arl` cookie of an already
+ * logged-in deezer.com. Validated before it is stored, so a bad paste says so at
+ * once instead of failing later at the write.
+ */
+app.post('/api/deezer/session/arl', async (req, res) => {
+  try {
+    // Accept the bare value, "arl=...", or a whole document.cookie dump - people
+     // copy whichever of those the devtools panel happens to give them.
+    const pasted = String(req.body?.arl || '').trim();
+    const value = (pasted.match(/arl=([A-Za-z0-9._-]{50,})/) || [])[1]
+      || (/^[A-Za-z0-9._-]{50,}$/.test(pasted) ? pasted : '');
+    if (!value) {
+      throw new HttpError(400, 'No arl value in that - it is a long string of letters and digits, around 190 characters.');
+    }
+    const probe = new GwClient(cookieTransport(value));
+    const user = await probe.refresh();
+    if (!user) throw new HttpError(401, 'That cookie is not a logged-in Deezer session - copy it again from a tab where you are signed in.');
+
+    fs.mkdirSync(path.dirname(GW_FILE), { recursive: true });
+    fs.writeFileSync(GW_FILE, JSON.stringify({ arl: value }, null, 2));
+    storedArl = value;
+    gw = null;
+    await browser.closeSession();      // no window is needed any more
+    res.json({ user });
+  } catch (err) { fail(res, err); }
+});
+
 app.post('/api/deezer/session/close', async (req, res) => {
   try {
     await browser.closeSession();   // cookies stay in the profile
@@ -171,6 +226,8 @@ app.post('/api/deezer/session/close', async (req, res) => {
 app.post('/api/deezer/session/forget', async (req, res) => {
   try {
     gw = null;
+    storedArl = null;
+    fs.rmSync(GW_FILE, { force: true });
     await browser.forgetSession();
     res.json({ ok: true });
   } catch (err) { fail(res, err); }
@@ -305,9 +362,9 @@ app.post('/api/deezer/push', async (req, res) => {
 app.use(express.static(path.join(HERE, 'public'), { extensions: ['html'] }));
 
 app.listen(PORT, () => {
-  console.log(`Spotify -> Deezer running on http://localhost:${PORT}`);
+  console.log(`Spotify -> Deezer running on http://localhost:${PORT}  (build ${BUILD})`);
   console.log(`   Spotify: ${spotifyApi.configured() ? 'app credentials (exact ISRC matching)' : 'no credentials - reading public pages'}`);
-  console.log(`   Deezer:  ${deezerApi.configured() ? 'app credentials available' : process.env.DEEZER_ARL ? 'arl cookie session' : 'browser login (no credentials needed)'}`);
+  console.log(`   Deezer:  ${deezerApi.configured() ? 'app credentials available' : arl() ? 'saved cookie session' : 'browser login (no credentials needed)'}`);
 });
 
 for (const sig of ['SIGINT', 'SIGTERM']) {

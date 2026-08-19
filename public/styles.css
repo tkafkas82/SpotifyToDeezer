@@ -53,9 +53,9 @@ main { max-width: 1080px; margin: 0 auto; padding: 22px 20px 40px; }
 label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
 
 .row { display: flex; gap: 10px; flex-wrap: wrap; }
-.row input[type=text] { flex: 1 1 320px; min-width: 0; }
+.row input[type=text], .row input[type=password] { flex: 1 1 320px; min-width: 0; }
 
-input[type=text], select {
+input[type=text], input[type=password], select {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--line);
@@ -63,7 +63,7 @@ input[type=text], select {
   padding: 10px 12px;
   font: inherit;
 }
-input[type=text]:focus, select:focus { outline: 2px solid var(--dz); outline-offset: 1px; }
+input[type=text]:focus, input[type=password]:focus, select:focus { outline: 2px solid var(--dz); outline-offset: 1px; }
 
 button {
   font: inherit;
@@ -92,6 +92,8 @@ button.ghost:hover { color: var(--text); }
 .chip.on { background: var(--panel-2); color: var(--text); border-color: #3a414f; }
 
 .hint, .muted { color: var(--muted); font-size: 13px; }
+.hint code { background: var(--panel-2); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+.build { color: var(--muted); opacity: .55; font-size: 11px; align-self: flex-end; }
 .hint { margin: 10px 0 0; }
 .hidden { display: none !important; }
 

@@ -80,7 +80,8 @@ async function loadConfig() {
     loadTargets();
   } else {
     box.append(el('span', 'dot'), el('span', null, 'Deezer: not connected'));
-    const login = el('button', 'primary', 'Connect Deezer');
+    const login = el('button', 'ghost', 'try browser login');
+    login.title = 'Deezer usually refuses to sign in inside an automated browser - the cookie below is the reliable route';
     login.onclick = () => connectSession(login);
     box.append(login);
     if (dz.hasKeys) {
@@ -89,6 +90,10 @@ async function loadConfig() {
       box.append(oauth);
     }
   }
+
+  // The cookie shortcut is only worth showing while there is nothing connected.
+  $('#arl-card').classList.toggle('hidden', Boolean(user) || dz.sessionMode === 'arl');
+  $('#build').textContent = `build ${cfg.build || '?'}`;
 
   $('#source-hint').textContent = cfg.spotify.hasKeys
     ? 'Reading with your Spotify app credentials: exact ISRC matching, any playlist length. Spotify’s own editorial playlists (Discover Weekly, Release Radar) are invisible to app tokens.'
@@ -110,8 +115,8 @@ async function connectSession(button) {
     }
 
     button.textContent = 'Waiting for login...';
-    toast('Log into Deezer in the window that just opened — this page notices by itself. '
-      + 'Email and password is the reliable way in; Google/Facebook sign-in often refuses an automated browser.');
+    toast('Log into Deezer in the window that just opened. Heads up: Deezer often refuses to complete a '
+      + 'login in an automated browser — if the form just re-appears with no error, use the cookie box below.');
     const deadline = Date.now() + 5 * 60_000;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 2500));
@@ -124,8 +129,8 @@ async function connectSession(button) {
         return loadConfig();
       }
     }
-    toast('Gave up waiting for the Deezer login. Press Connect again once you are logged in — '
-      + 'or paste your deezer.com `arl` cookie into .env as DEEZER_ARL to skip the window.', true);
+    toast('No login came through — that is Deezer refusing an automated browser, not you. '
+      + 'Use the cookie box instead.', true);
   } catch (err) {
     toast(err.message, true);
   } finally {
@@ -440,6 +445,25 @@ function exportCsv() {
 
 // --- wiring --------------------------------------------------------------
 
+async function saveArl() {
+  const value = $('#arl').value.trim();
+  if (!value) return toast('Paste the cookie value first', true);
+  $('#arl-save').disabled = true;
+  try {
+    const res = await post('/api/deezer/session/arl', { arl: value });
+    if (res.error) throw new Error(res.error);
+    $('#arl').value = '';
+    toast(`Connected as ${res.user.name}`);
+    loadConfig();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    $('#arl-save').disabled = false;
+  }
+}
+
+$('#arl-save').onclick = saveArl;
+$('#arl').addEventListener('keydown', e => { if (e.key === 'Enter') saveArl(); });
 $('#go').onclick = start;
 $('#url').addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
 $('#push').onclick = push;

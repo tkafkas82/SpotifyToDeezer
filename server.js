@@ -23,7 +23,7 @@ import * as spotifyApi from './lib/spotify.js';
 import * as spotifyPublic from './lib/spotify-public.js';
 import * as deezerApi from './lib/deezer.js';
 import * as deezerSearch from './lib/deezer.js';
-import { GwClient, cookieTransport, pageTransport } from './lib/deezer-gw.js';
+import { GwClient, cookieTransport, browserTransport } from './lib/deezer-gw.js';
 import * as browser from './lib/browser.js';
 import { convertPlaylist } from './lib/convert.js';
 import { cache, flush } from './lib/store.js';
@@ -45,20 +45,27 @@ const fail = (res, err) => {
 
 // --- the two Deezer session flavours -------------------------------------
 
-// Cookie transport when an `arl` is pasted in .env, otherwise the logged-in tab.
+// Cookie transport when an `arl` is pasted in .env, otherwise the browser profile.
 let gw = null;
 function gwClient() {
   if (!gw) {
     gw = process.env.DEEZER_ARL
       ? new GwClient(cookieTransport(process.env.DEEZER_ARL))
-      : new GwClient(pageTransport(() => browser.pageFor(DEEZER_HOME)));
+      : new GwClient(browserTransport(() => browser.requestApi()));
   }
   return gw;
 }
 
-/** Who the key-free session belongs to, without ever opening a window uninvited. */
-async function sessionUser({ mayOpenBrowser = false } = {}) {
-  if (!process.env.DEEZER_ARL && !browser.sessionOpen() && !mayOpenBrowser) return null;
+/**
+ * Who the key-free session belongs to.
+ *
+ * `mayOpen` allows starting the *headless* profile to answer the question - no
+ * window, just the cookies already on disk. Without a profile there is nothing to
+ * ask, so a first-time visitor never triggers a browser launch.
+ */
+async function sessionUser({ mayOpen = false } = {}) {
+  const usable = process.env.DEEZER_ARL || browser.sessionOpen() || (mayOpen && browser.profileExists());
+  if (!usable) return null;
   try {
     return await gwClient().refresh();
   } catch {
@@ -95,7 +102,7 @@ const apiWriter = () => ({
 /** Registered app first when it is actually connected, else the web session. */
 async function resolveWriter() {
   if (deezerApi.configured() && await deezerApi.currentUser()) return apiWriter();
-  if (await sessionUser()) return gwWriter(gwClient());
+  if (await sessionUser({ mayOpen: true })) return gwWriter(gwClient());
   throw new HttpError(401, process.env.DEEZER_ARL
     ? 'That DEEZER_ARL cookie is not a logged-in Deezer session any more - grab a fresh one.'
     : 'Connect Deezer first (a browser window opens; log in there once).');
@@ -107,7 +114,7 @@ const resolveReader = () => (spotifyApi.configured() ? spotifyApi : spotifyPubli
 
 app.get('/api/config', async (req, res) => {
   try {
-    const user = await sessionUser();
+    const user = await sessionUser({ mayOpen: true });
     res.set('Cache-Control', 'no-store').json({
       spotify: {
         mode: spotifyApi.configured() ? 'api' : 'public',
@@ -133,22 +140,24 @@ app.get('/api/config', async (req, res) => {
 app.post('/api/deezer/session/open', async (req, res) => {
   try {
     if (process.env.DEEZER_ARL) {
-      const user = await sessionUser({ mayOpenBrowser: true });
+      const user = await sessionUser({ mayOpen: true });
       if (!user) throw new HttpError(401, 'That DEEZER_ARL cookie is not logged in.');
       return res.json({ user, opened: false });
     }
-    // Land on the login page when there is no stored session, on the home page
-    // when there is - going straight to /login while already signed in is a
-    // confusing thing to show someone.
-    const user = browser.profileExists() ? await sessionUser({ mayOpenBrowser: true }) : null;
-    await browser.pageFor(user ? DEEZER_HOME : 'https://www.deezer.com/login');
-    res.json({ user, opened: true });
+    // A stored login answers for itself headlessly; only a missing one is worth
+    // putting a window on someone's screen for.
+    const known = await sessionUser({ mayOpen: true });
+    if (known) return res.json({ user: known, opened: false });
+
+    await browser.showPage(`${DEEZER_HOME}login`);
+    res.json({ user: null, opened: true });
   } catch (err) { fail(res, err); }
 });
 
 app.get('/api/deezer/session/check', async (req, res) => {
   try {
-    res.set('Cache-Control', 'no-store').json({ user: await sessionUser({ mayOpenBrowser: false }) });
+    // Never opens or touches a window: the login in progress must be left alone.
+    res.set('Cache-Control', 'no-store').json({ user: await sessionUser() });
   } catch (err) { fail(res, err); }
 });
 

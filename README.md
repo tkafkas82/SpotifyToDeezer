@@ -22,9 +22,14 @@ npm run probe             # match a sample track list against live Deezer
 
 1. `start.bat`
 2. Click **Connect Deezer**. A Chrome window opens on Deezer's login page — log in
-   there. The page notices by itself and the window can then be closed; the session
-   is remembered in `data/browser/` for next time.
+   there with **email and password**; Google/Facebook sign-in often refuses a browser
+   it can tell is automated. The page notices the login by itself and closes the
+   window; the session is remembered in `data/browser/` and every later check or
+   write reuses it headlessly, with nothing appearing on screen.
 3. Paste a Spotify playlist link, **Match tracks**, tick what you want, **Add to Deezer**.
+
+If the login window keeps bouncing back to the sign-in form, use the `arl` cookie
+below instead — no window is involved at all.
 
 Chrome or Edge is used if installed, so nothing is downloaded. If neither is there,
 `npx playwright install chromium` provides one.
@@ -70,6 +75,12 @@ never have to leave the browser), or plain Node with the `arl` cookie.
 
 Being undocumented, that gateway can change without notice — `lib/deezer.js` (the
 registered-app path) is the stable route, `lib/deezer-gw.js` the no-setup one.
+
+The status polling deliberately never touches a tab. Deezer's login lives on
+`account.deezer.com`, a different host from `www.deezer.com`, so an earlier version
+that ran its check inside a Deezer tab kept deciding the tab had "wandered off" and
+opening a fresh one on top of the login every 2.5 seconds. Checks now go through the
+context's cookie jar (`ctx.request`), which needs no page at all.
 
 ## How matching works
 

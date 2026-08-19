@@ -110,17 +110,22 @@ async function connectSession(button) {
     }
 
     button.textContent = 'Waiting for login...';
-    toast('Log into Deezer in the window that just opened — this page picks it up by itself.');
+    toast('Log into Deezer in the window that just opened — this page notices by itself. '
+      + 'Email and password is the reliable way in; Google/Facebook sign-in often refuses an automated browser.');
     const deadline = Date.now() + 5 * 60_000;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 2500));
       const { user } = await fetch('/api/deezer/session/check').then(r => r.json());
       if (user) {
+        // The window has done its job; the login stays in the profile and later
+        // writes reuse it without anything appearing on screen.
+        await post('/api/deezer/session/close');
         toast(`Connected as ${user.name}`);
         return loadConfig();
       }
     }
-    toast('Gave up waiting for the Deezer login. Press Connect again once you are logged in.', true);
+    toast('Gave up waiting for the Deezer login. Press Connect again once you are logged in — '
+      + 'or paste your deezer.com `arl` cookie into .env as DEEZER_ARL to skip the window.', true);
   } catch (err) {
     toast(err.message, true);
   } finally {

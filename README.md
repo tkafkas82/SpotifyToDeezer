@@ -4,112 +4,144 @@ Copies a Spotify playlist into Deezer. Paste a playlist link, watch every track 
 matched against the Deezer catalogue, fix or drop the doubtful ones, then write the
 result into a new or existing Deezer playlist.
 
-Runs entirely on this machine — the Deezer token lives in `data/token.json` and
-nothing is sent anywhere except to Spotify's and Deezer's own APIs.
+**No API keys, no app registrations.** The only thing it needs from you is a Deezer
+login, once, in a browser window it opens itself — writing to your library needs
+proof it is you, and that login is the proof.
+
+Everything runs on this machine. Nothing is sent anywhere except to Spotify's and
+Deezer's own servers.
 
 ```
 start.bat                 # installs, opens http://localhost:4870, runs the server
 npm start                 # same thing without the browser
-npm test                  # 20 offline tests (matching rules + fan-out logic)
-npm run probe             # match a sample track list against live Deezer, no Spotify needed
+npm test                  # 29 offline tests
+npm run probe             # match a sample track list against live Deezer
 ```
 
-## Setup
+## First run
 
-Two free app registrations, both about a minute of work.
+1. `start.bat`
+2. Click **Connect Deezer**. A Chrome window opens on Deezer's login page — log in
+   there. The page notices by itself and the window can then be closed; the session
+   is remembered in `data/browser/` for next time.
+3. Paste a Spotify playlist link, **Match tracks**, tick what you want, **Add to Deezer**.
 
-**Spotify** — <https://developer.spotify.com/dashboard> → *Create app*. Any redirect
-URI is fine (the app only uses the client-credentials flow); `http://localhost:4870/callback`
-does. Copy the Client ID and Client Secret.
+Chrome or Edge is used if installed, so nothing is downloaded. If neither is there,
+`npx playwright install chromium` provides one.
 
-**Deezer** — <https://developers.deezer.com/myapps> → *Create a new application*:
+### Optional: skip the browser window
 
-| Field | Value |
-| --- | --- |
-| Application domain | `localhost` |
-| Redirect URL after authentication | `http://localhost:4870/api/deezer/callback` |
+Paste the `arl` cookie from a logged-in deezer.com (DevTools → Application →
+Cookies → `arl`) into `.env` as `DEEZER_ARL=...` and the writes go straight through
+Node with no window at all. That cookie *is* your Deezer session — treat it like a
+password.
 
-Then fill in `.env` (copied from `.env.example` on first run):
+### Optional: API keys
 
-```ini
-SPOTIFY_CLIENT_ID=...
-SPOTIFY_CLIENT_SECRET=...
-DEEZER_APP_ID=...
-DEEZER_APP_SECRET=...
-```
+Registering apps buys two things, and nothing else:
 
-Restart, click **Connect Deezer**, approve the `manage_library` permission. That
-consent is what lets the app write playlists; reading the Spotify side needs no
-login at all.
+| | keyless | with keys |
+| --- | --- | --- |
+| Spotify playlist length | first 100 tracks instantly, longer read by scrolling a headless browser (~30 s for 200) | any length in one request |
+| Spotify ISRC | not published on public pages | yes → exact identity matching |
+| Spotify editorial playlists (Discover Weekly, Release Radar) | **readable** | 404 — app tokens cannot see them |
+| Deezer writes | your own web session | documented OAuth API, stable |
+
+See `.env.example`. Keys are used automatically whenever they are present.
+
+## How the keyless side works
+
+**Reading Spotify.** `open.spotify.com/embed/playlist/{id}` ships the track list as
+JSON inside the page its iframe player runs on: one request, no browser, and it
+covers editorial playlists that a registered app is refused. It caps at 100 tracks,
+so longer playlists are read by scrolling the ordinary public page in a headless
+browser and harvesting rows as they render (the list is virtualised — rows only
+exist in the DOM near the viewport).
+
+Not used: Spotify's web-player token endpoint, which answers *"Usage of this
+endpoint is not permitted under the Spotify Developer Terms"*. The keyless path
+stays on ordinary public pages.
+
+**Writing Deezer.** `gw-light.php` is the gateway Deezer's own website calls. It
+authenticates with the normal web-session cookie plus a CSRF token (`checkForm`)
+instead of an OAuth app, so `playlist.create` and `playlist.addSongs` work as you.
+Two ways in, same calls: a `fetch` executed *inside* the logged-in tab (cookies
+never have to leave the browser), or plain Node with the `arl` cookie.
+
+Being undocumented, that gateway can change without notice — `lib/deezer.js` (the
+registered-app path) is the stable route, `lib/deezer-gw.js` the no-setup one.
 
 ## How matching works
 
 Deezer and Spotify agree on almost nothing except the recording itself, so the
 matcher works from the most certain signal down:
 
-1. **ISRC.** Spotify exposes each track's ISRC and Deezer can look one up directly
-   (`/track/isrc:...`). That is identity, not similarity — it is right even when the
-   titles are spelled differently. Roughly 85% of a typical playlist resolves here.
-   The hit is only trusted when it is *playable in your country*: Deezer often
-   carries the same recording twice and the ISRC can land on the copy whose licence
-   is dead locally, in which case the search fallback finds the playable one.
-2. **Scoped search** on the decoration-stripped title (`artist:"Queen" track:"Bohemian Rhapsody"`),
-   for tracks with no ISRC or no ISRC hit.
-3. **Free-text search**, which catches the tracks Deezer files under a different
-   primary artist.
-4. **Transliterated search.** Deezer stores Greek artists under both spellings
+1. **ISRC** (only with Spotify keys) — Deezer can look one up directly
+   (`/track/isrc:…`). That is identity, not similarity. The hit is trusted only when
+   it is *playable in your country*: Deezer often carries the same recording twice
+   and the ISRC can land on the copy whose licence is dead locally, in which case
+   search finds the playable one.
+2. **Free-text search** — the reliable workhorse. Deezer's scoped field search
+   silently answers "no results" for plenty of real titles (verified with *BIRDS OF A
+   FEATHER*), so plain text goes first.
+3. **Scoped search** (`artist:"Queen" track:"Bohemian Rhapsody"`) as a second
+   opinion, on the decoration-stripped title.
+4. **Transliterated search** — Deezer stores Greek artists under both spellings
    (`Σάκης Ρουβάς` and `Sakis Rouvas`) while Spotify picks one, so the query is
-   retried romanised. Greek titles that would otherwise never match do.
+   retried romanised. Greek tracks that would otherwise never match do.
 
 Every candidate is scored 0–100 on title (55), artist (30) and duration (15), with
 four rules that keep the confident tier honest:
 
 - **Decoration is stripped, identity is not.** "Remastered 2011", "(Deluxe Edition)"
-  and "(feat. X)" are noise. "Live", "Remix", "Acoustic" are *not* — those are
-  different recordings, and a version marker on one side only caps the score into
-  the review tier. This matters because Deezer's `title_short` hides them:
-  "Bohemian Rhapsody (Live At Wembley)" shortens to "Bohemian Rhapsody", which would
-  otherwise score as a perfect match.
+  and "(feat. X)" are noise. "Live", "Remix", "Acoustic" are *not* — a version marker
+  on one side only caps the score into the review tier. This matters because Deezer's
+  `title_short` hides them: "Bohemian Rhapsody (Live At Wembley)" shortens to
+  "Bohemian Rhapsody", which would otherwise look like a perfect match.
 - **A different performer is not a match.** Search results are full of karaoke and
-  tribute recordings with the exact right title; a weak artist score halves the
-  total, and a middling one caps it below auto-accept.
+  tribute recordings with exactly the right title.
 - **A duration gulf means a different version** — extended mix, edit, or a 45-second
   skit sharing a name with a five-minute song.
 - **Unavailable in your country never auto-selects.**
 
-Scores ≥ 78 are ticked automatically, 55–77 are shown unticked as *needs review*,
-the rest are *not found*. Nothing gets written to Deezer that you did not tick.
+≥ 78 is ticked automatically, 55–77 is shown unticked as *needs review*, the rest is
+*not found*. Nothing is written to Deezer that you did not tick.
+
+Measured keyless, from a cold cache: *Top 50 Global* → 49 matched / 1 rejected
+(genuinely a different song) in 15 s. *Rock Classics*, 200 tracks → 199 matched /
+1 review (Deezer only has a live cut) in 77 s including the browser read.
 
 ## Using it
 
-1. Paste the playlist link → **Match tracks**. Results stream in as they resolve.
-2. Filter to **Needs review** and work through them: **change** opens the other
+1. Paste the link → **Match tracks**. Results stream in as they resolve.
+2. Filter to **Needs review** and work through them: **change** offers the other
    candidates plus a free Deezer search box, **find** does the same for the misses.
-3. Pick the destination — a new playlist (name prefilled from Spotify) or one of
-   your existing ones — and hit **Add to Deezer**. Appending to an existing playlist
-   skips tracks already in it, so re-running is safe.
-4. **Export CSV** dumps the full match table, including what was not found.
-
-Public playlists only. Spotify's own algorithmic and editorial playlists (Discover
-Weekly, Release Radar, most *Made for you* mixes) return 404 to any third-party app
-token — copy them into a playlist of your own first, and that copy works.
+3. Pick the destination — a new playlist (name prefilled from Spotify) or an existing
+   one — and hit **Add to Deezer**. Appending skips tracks already in the playlist,
+   so re-running is safe.
+4. **Export CSV** dumps the whole match table, including what was not found.
 
 ## Layout
 
 ```
-server.js            Express routes; SSE for the conversion stream
-lib/spotify.js       client-credentials token, playlist + paged track reads
-lib/deezer.js        OAuth, search, ISRC lookup, playlist create/append
-lib/match.js         the strategy above, plus scoring
-lib/normalize.js     title/artist normalisation and Greek transliteration
-lib/convert.js       the fan-out over a playlist (6 lookups in flight)
-lib/store.js         disk cache of every ISRC/search answer
-lib/http.js          rate limiter + retrying JSON fetch
-public/              the single-page UI
-scripts/probe.js     match a track list from the command line
+server.js               Express routes, SSE conversion stream, picks keyed vs keyless
+lib/spotify-public.js   keyless read: embed JSON, then browser scroll for >100
+lib/spotify.js          keyed read: client-credentials token, paged track reads
+lib/deezer-gw.js        keyless write: Deezer's own gateway over your web session
+lib/deezer.js           keyed write: OAuth, plus the public search used by both
+lib/browser.js          Chrome/Edge/Chromium: headed login profile, headless scraper
+lib/match.js            the strategy above, plus scoring
+lib/normalize.js        title/artist normalisation and Greek transliteration
+lib/convert.js          the fan-out over a playlist (6 lookups in flight)
+lib/store.js            disk cache of every ISRC/search answer
+lib/http.js             rate limiter + retrying JSON fetch
+public/                 the single-page UI
+scripts/probe.js        match a track list from the command line
 ```
 
-Two things about Deezer worth knowing if you touch `lib/deezer.js`: errors arrive as
-HTTP 200 with an `{error:{...}}` body, and the quota (~50 requests / 5 s) reports as
-`code 4` rather than a 429. Both are handled in `call()`; the disk cache in
-`lib/store.js` means a second run of the same playlist costs no requests at all.
+Three things about Deezer worth knowing before touching `lib/deezer.js`: errors
+arrive as HTTP 200 with an `{error:{…}}` body; the quota reports as `code 4` rather
+than a 429; and a burst of searches gets an *Access Denied* HTML page from its edge
+well before the documented 50 requests / 5 s, which is why the limiter sits at 22 and
+an unparseable body is treated as a throttle and retried. The disk cache is what
+makes a re-run instant — the same playlist twice costs no requests at all.

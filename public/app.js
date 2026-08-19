@@ -5,6 +5,10 @@
  * filled in as match events land: the server matches six tracks at a time, so
  * results come back out of order, and pre-allocating is what keeps the list in
  * playlist order without buffering everything until the end.
+ *
+ * Connecting Deezer without app credentials is a two-step affair - open a browser
+ * window, then wait for the login to happen in it - so that button starts a poll
+ * rather than awaiting a single request.
  */
 
 const $ = sel => document.querySelector(sel);
@@ -19,7 +23,8 @@ const state = {
   playlist: null,
   tracks: [],          // { spotify, status, best, candidates, selected, node }
   filter: 'all',
-  user: null,
+  deezerReady: false,
+  cfg: null,
 };
 
 const mmss = ms => {
@@ -34,57 +39,104 @@ function toast(message, bad = false) {
   t.classList.toggle('bad', bad);
   t.classList.remove('hidden');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.add('hidden'), bad ? 8000 : 3500);
+  toastTimer = setTimeout(() => t.classList.add('hidden'), bad ? 8000 : 4000);
 }
+
+const post = (url, body) => fetch(url, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: body ? JSON.stringify(body) : undefined,
+}).then(r => r.json());
 
 // --- account -------------------------------------------------------------
 
 async function loadConfig() {
   const cfg = await fetch('/api/config').then(r => r.json());
-  state.user = cfg.deezerUser;
+  state.cfg = cfg;
+  const dz = cfg.deezer;
+  const user = dz.oauthUser || dz.sessionUser;
+  state.deezerReady = Boolean(user);
 
   const box = $('#account');
   box.replaceChildren();
-  if (cfg.deezerUser) {
-    if (cfg.deezerUser.picture) {
+
+  if (user) {
+    if (user.picture) {
       const img = el('img');
-      img.src = cfg.deezerUser.picture;
+      img.src = user.picture;
       img.alt = '';
       box.append(img);
     }
-    box.append(el('span', 'dot on'), el('span', null, `Deezer: ${cfg.deezerUser.name}`));
-    const out = el('button', 'ghost', 'Disconnect');
-    out.onclick = async () => {
-      await fetch('/api/deezer/logout', { method: 'POST' });
+    const how = dz.oauthUser ? 'app login' : dz.sessionMode === 'arl' ? 'arl cookie' : 'browser session';
+    box.append(el('span', 'dot on'), el('span', null, `Deezer: ${user.name}`), el('span', 'muted', `(${how})`));
+    const drop = el('button', 'ghost', 'Disconnect');
+    drop.onclick = async () => {
+      if (dz.oauthUser) await post('/api/deezer/logout');
+      else await post('/api/deezer/session/forget');
+      toast('Disconnected from Deezer');
       loadConfig();
     };
-    box.append(out);
+    box.append(drop);
     loadTargets();
   } else {
     box.append(el('span', 'dot'), el('span', null, 'Deezer: not connected'));
     const login = el('button', 'primary', 'Connect Deezer');
-    login.disabled = !cfg.deezerConfigured;
-    login.title = cfg.deezerConfigured ? '' : 'Set DEEZER_APP_ID / DEEZER_APP_SECRET in .env first';
-    login.onclick = () => { location.href = '/api/deezer/login'; };
+    login.onclick = () => connectSession(login);
     box.append(login);
+    if (dz.hasKeys) {
+      const oauth = el('button', 'ghost', 'use app keys');
+      oauth.onclick = () => { location.href = '/api/deezer/login'; };
+      box.append(oauth);
+    }
   }
 
-  if (!cfg.spotifyConfigured) {
-    $('#source-hint').textContent =
-      'Spotify credentials are missing: put SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env and restart.';
-  }
+  $('#source-hint').textContent = cfg.spotify.hasKeys
+    ? 'Reading with your Spotify app credentials: exact ISRC matching, any playlist length. Spotify’s own editorial playlists (Discover Weekly, Release Radar) are invisible to app tokens.'
+    : 'No credentials needed — the playlist is read off Spotify’s public pages, editorial playlists included. The first 100 tracks arrive instantly; longer playlists are read in a background browser, which takes a few seconds more.';
   return cfg;
+}
+
+/** Opens the Deezer window, then waits for the login to land in it. */
+async function connectSession(button) {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Opening browser...';
+  try {
+    const res = await post('/api/deezer/session/open');
+    if (res.error) throw new Error(res.error);
+    if (res.user) {
+      toast(`Connected as ${res.user.name}`);
+      return loadConfig();
+    }
+
+    button.textContent = 'Waiting for login...';
+    toast('Log into Deezer in the window that just opened — this page picks it up by itself.');
+    const deadline = Date.now() + 5 * 60_000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 2500));
+      const { user } = await fetch('/api/deezer/session/check').then(r => r.json());
+      if (user) {
+        toast(`Connected as ${user.name}`);
+        return loadConfig();
+      }
+    }
+    toast('Gave up waiting for the Deezer login. Press Connect again once you are logged in.', true);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
 }
 
 async function loadTargets() {
   try {
-    const { playlists } = await fetch('/api/deezer/playlists').then(r => r.json());
+    const { playlists, error } = await fetch('/api/deezer/playlists').then(r => r.json());
+    if (error) return;
     const sel = $('#target');
     const keep = sel.value;
     sel.replaceChildren(new Option('New Deezer playlist...', ''));
-    for (const p of playlists || []) {
-      sel.append(new Option(`${p.title} (${p.nbTracks})`, p.id));
-    }
+    for (const p of playlists || []) sel.append(new Option(`${p.title} (${p.nbTracks})`, p.id));
     sel.value = keep;
     syncTargetInputs();
   } catch { /* not connected yet - the dock stays on "new playlist" */ }
@@ -127,10 +179,13 @@ function start() {
 
   es.addEventListener('playlist', e => {
     state.playlist = JSON.parse(e.data);
-    $('#pl-name').textContent = state.playlist.name;
-    $('#pl-meta').textContent = [state.playlist.owner, `${state.playlist.count} tracks`].filter(Boolean).join(' - ');
-    if (!$('#new-name').value) $('#new-name').value = state.playlist.name;
-    buildRows(state.playlist.count);
+    const p = state.playlist;
+    $('#pl-name').textContent = p.name;
+    $('#pl-meta').textContent = [p.owner, `${p.count} tracks`, p.source === 'browser' ? 'read in a browser' : null]
+      .filter(Boolean).join(' - ');
+    if (p.warning) toast(p.warning, true);
+    if (!$('#new-name').value) $('#new-name').value = p.name;
+    buildRows(p.count);
     $('#step-results').classList.remove('hidden');
     $('#dock').classList.remove('hidden');
   });
@@ -215,7 +270,7 @@ function renderRow(row) {
   const left = el('div', 'side sp');
   left.append(
     el('div', 't', row.spotify ? row.spotify.title : 'loading...'),
-    el('div', 'a', row.spotify ? `${row.spotify.artists.join(', ')} - ${mmss(row.spotify.durationMs)}` : ''),
+    el('div', 'a', row.spotify ? `${row.spotify.artists[0] || ''} - ${mmss(row.spotify.durationMs)}` : ''),
   );
   n.append(left, el('div', 'to', row.status === 'missing' ? '✗' : '→'));
 
@@ -231,7 +286,8 @@ function renderRow(row) {
     if (!row.best.readable) detail.push('unavailable in your country');
     right.append(t, el('div', 'a', detail.join(' - ')));
   } else {
-    right.append(el('div', 'none', row.error || (row.status === 'skipped' ? row.reason || 'skipped' : row.status === 'pending' ? '' : 'nothing on Deezer')));
+    right.append(el('div', 'none', row.error
+      || (row.status === 'skipped' ? row.reason || 'skipped' : row.status === 'pending' ? '' : 'nothing on Deezer')));
   }
   n.append(right);
 
@@ -267,7 +323,7 @@ let pickerRow = null;
 
 function openPicker(row) {
   pickerRow = row;
-  $('#picker-title').textContent = `${row.spotify.artists.join(', ')} - ${row.spotify.title}`;
+  $('#picker-title').textContent = `${row.spotify.artists[0] || ''} - ${row.spotify.title}`;
   $('#picker-q').value = row.spotify.query || `${row.spotify.artists[0] || ''} ${row.spotify.title}`.trim();
   renderPicks(row.candidates || []);
   $('#picker').showModal();
@@ -285,7 +341,8 @@ function renderPicks(list) {
     const meta = el('div', 'meta');
     meta.append(
       el('div', 't', c.title),
-      el('div', 'a', [c.artists.join(', '), c.album, mmss(c.durationMs), c.readable ? null : 'unavailable'].filter(Boolean).join(' - ')),
+      el('div', 'a', [c.artists.join(', '), c.album, mmss(c.durationMs), c.readable ? null : 'unavailable']
+        .filter(Boolean).join(' - ')),
     );
     const right = el('div', 'right');
     if (typeof c.score === 'number') right.append(el('span', 'badge na', String(c.score)));
@@ -319,7 +376,7 @@ async function pickerSearch() {
 async function push() {
   const chosen = state.tracks.filter(t => t.selected && t.best);
   if (!chosen.length) return;
-  if (!state.user) return toast('Connect Deezer first', true);
+  if (!state.deezerReady) return toast('Connect Deezer first', true);
 
   const playlistId = $('#target').value;
   const title = $('#new-name').value.trim() || state.playlist?.name || 'Imported from Spotify';
@@ -327,16 +384,12 @@ async function push() {
   $('#push').textContent = 'Adding...';
 
   try {
-    const res = await fetch('/api/deezer/push', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        trackIds: chosen.map(t => t.best.id),
-        playlistId: playlistId || undefined,
-        title,
-        description: state.playlist ? `Copied from Spotify: ${state.playlist.name}` : undefined,
-      }),
-    }).then(r => r.json());
+    const res = await post('/api/deezer/push', {
+      trackIds: chosen.map(t => t.best.id),
+      playlistId: playlistId || undefined,
+      title,
+      description: state.playlist ? `Copied from Spotify: ${state.playlist.name}` : undefined,
+    });
     if (res.error) throw new Error(res.error);
 
     const box = $('#push-result');

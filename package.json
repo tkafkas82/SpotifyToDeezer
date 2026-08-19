@@ -1,7 +1,7 @@
 {
   "name": "spotify-to-deezer",
   "version": "1.0.0",
-  "description": "Copy a Spotify playlist into Deezer: reads the playlist, matches every track on Deezer (ISRC first, fuzzy search second), then writes the matches into a real Deezer playlist",
+  "description": "Copy a Spotify playlist into Deezer with no API keys: reads the playlist off Spotify's public pages, matches every track on Deezer, then writes the matches into a real Deezer playlist through your own logged-in session",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -10,7 +10,8 @@
     "probe": "node scripts/probe.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "playwright-core": "^1.62.1"
   },
   "engines": {
     "node": ">=20"

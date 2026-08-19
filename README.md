@@ -70,8 +70,9 @@ stays on ordinary public pages.
 **Writing Deezer.** `gw-light.php` is the gateway Deezer's own website calls. It
 authenticates with the normal web-session cookie plus a CSRF token (`checkForm`)
 instead of an OAuth app, so `playlist.create` and `playlist.addSongs` work as you.
-Two ways in, same calls: a `fetch` executed *inside* the logged-in tab (cookies
-never have to leave the browser), or plain Node with the `arl` cookie.
+Two ways in, same calls: through the logged-in browser profile's cookie jar (the
+cookies never have to leave the browser, and no tab is used), or plain Node with the
+`arl` cookie.
 
 Being undocumented, that gateway can change without notice — `lib/deezer.js` (the
 registered-app path) is the stable route, `lib/deezer-gw.js` the no-setup one.

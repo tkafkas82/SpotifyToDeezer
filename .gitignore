@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.local
+data/token.json
+data/cache.json
+server.out
+server.err

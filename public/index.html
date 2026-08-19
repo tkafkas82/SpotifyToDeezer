@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spotify to Deezer</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#127925;</text></svg>">
+</head>
+<body>
+
+<header>
+  <h1><span class="sp">Spotify</span> <span class="arrow">&rarr;</span> <span class="dz">Deezer</span></h1>
+  <div id="account" class="account"></div>
+</header>
+
+<main>
+  <section class="card" id="step-source">
+    <label for="url">Spotify playlist link</label>
+    <div class="row">
+      <input id="url" type="text" spellcheck="false"
+             placeholder="https://open.spotify.com/playlist/37i9dQZF1DX..." autocomplete="off">
+      <button id="go" class="primary">Match tracks</button>
+    </div>
+    <p class="hint" id="source-hint">
+      Public playlists only. Spotify&rsquo;s own editorial and &ldquo;Made for you&rdquo; playlists
+      (Discover Weekly, Release Radar) are not readable by third-party apps.
+    </p>
+  </section>
+
+  <section class="card hidden" id="step-progress">
+    <div class="prog-head">
+      <div>
+        <strong id="pl-name">&nbsp;</strong>
+        <span class="muted" id="pl-meta"></span>
+      </div>
+      <span class="muted" id="prog-text"></span>
+    </div>
+    <div class="bar"><div id="bar-fill"></div></div>
+    <div class="counts" id="counts"></div>
+  </section>
+
+  <section class="card hidden" id="step-results">
+    <div class="results-head">
+      <div class="filters" id="filters">
+        <button data-filter="all" class="chip on">All</button>
+        <button data-filter="matched" class="chip">Matched</button>
+        <button data-filter="review" class="chip">Needs review</button>
+        <button data-filter="missing" class="chip">Not found</button>
+      </div>
+      <div class="bulk">
+        <button id="sel-all" class="ghost">Select all</button>
+        <button id="sel-none" class="ghost">Select none</button>
+        <button id="sel-sure" class="ghost">Only confident</button>
+        <button id="csv" class="ghost">Export CSV</button>
+      </div>
+    </div>
+    <div id="rows" class="rows"></div>
+  </section>
+</main>
+
+<footer id="dock" class="hidden">
+  <div class="dock-inner">
+    <div class="dock-count"><strong id="sel-count">0</strong> <span id="sel-label">tracks selected</span></div>
+    <div class="dock-target">
+      <select id="target">
+        <option value="">New Deezer playlist&hellip;</option>
+      </select>
+      <input id="new-name" type="text" placeholder="Playlist name">
+    </div>
+    <button id="push" class="primary">Add to Deezer</button>
+  </div>
+  <div id="push-result" class="push-result hidden"></div>
+</footer>
+
+<div id="toast" class="toast hidden"></div>
+
+<dialog id="picker">
+  <form method="dialog">
+    <h2 id="picker-title">Pick the right track</h2>
+    <div class="row">
+      <input id="picker-q" type="text" placeholder="Search Deezer" autocomplete="off">
+      <button id="picker-search" class="ghost" type="button">Search</button>
+    </div>
+    <div id="picker-list" class="picker-list"></div>
+    <menu>
+      <button value="cancel" class="ghost">Close</button>
+    </menu>
+  </form>
+</dialog>
+
+<script src="app.js" type="module"></script>
+</body>
+</html>

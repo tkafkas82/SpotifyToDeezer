@@ -7,3 +7,5 @@ data/browser/
 server.out
 server.err
 data/gw.json
+data/users.json
+data/secret.key

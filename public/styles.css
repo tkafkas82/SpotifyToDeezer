@@ -97,10 +97,32 @@ button.ghost:hover { color: var(--text); }
 .hint { margin: 10px 0 0; }
 .hidden { display: none !important; }
 
+.header-right { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; justify-content: flex-end; }
 .account { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.account:empty { display: none; }
 .account img { width: 26px; height: 26px; border-radius: 50%; }
 .account .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); display: inline-block; }
 .account .dot.on { background: var(--sp); }
+#me { padding-right: 16px; border-right: 1px solid var(--line); }
+
+/* the sign-in gate: nothing else on the page works until Google says who you are */
+body.gated main > section:not(.gate),
+body.gated footer { display: none; }
+.gate { max-width: 520px; margin: 40px auto; text-align: center; }
+.gate h2 { font-size: 17px; margin: 0 0 10px; }
+.gate .hint { text-align: left; }
+button.google {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 10px 18px;
+  background: #fff;
+  color: #1f1f1f;
+  font-weight: 600;
+  font-size: 14px;
+}
+button.google:hover { background: #f1f3f4; }
 
 /* progress */
 .prog-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 10px; }

@@ -9,13 +9,15 @@ your Deezer account is yours: paste your `arl` session cookie once (four clicks 
 devtools, instructions in the app). Everything else — reading the Spotify playlist,
 searching Deezer, matching — needs nothing at all.
 
-Everything runs on this machine. Nothing is sent anywhere except to Spotify's and
-Deezer's own servers.
+By default everything runs on this machine as a single-user tool, and nothing is sent
+anywhere except to Spotify's and Deezer's own servers. Add Google credentials and it
+becomes a small multi-user app instead, where everyone signs in and connects their own
+Deezer account — see [More than one user](#more-than-one-user).
 
 ```
 start.bat                 # installs, opens http://localhost:4870, runs the server
 npm start                 # same thing without the browser
-npm test                  # 29 offline tests
+npm test                  # 46 offline tests
 npm run probe             # match a sample track list against live Deezer
 ```
 
@@ -25,9 +27,9 @@ npm run probe             # match a sample track list against live Deezer
 2. **Connect Deezer with your session cookie.** In your *normal* browser, signed in to
    deezer.com: `F12` → **Application** → **Cookies** → `https://www.deezer.com` → copy
    the value of `arl` (a long string, ~190 characters) and paste it into the box on the
-   page. It is validated against Deezer before it is kept, and stored only in
-   `data/gw.json` on this machine. That cookie *is* your Deezer session — treat it like
-   a password.
+   page. It is validated against Deezer before it is kept, and stored encrypted in
+   `data/users.json` on this machine. That cookie *is* your Deezer session — treat it
+   like a password.
 3. Paste a Spotify playlist link, **Match tracks**, tick what you want, **Add to Deezer**.
 
 Why the cookie and not a login form: Deezer will not complete a sign-in inside an
@@ -51,6 +53,47 @@ Registering apps buys two things, and nothing else:
 | Deezer writes | your own web session | documented OAuth API, stable |
 
 See `.env.example`. Keys are used automatically whenever they are present.
+
+## More than one user
+
+Filling in `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` puts a Google sign-in in front
+of the app. Nothing else needs configuring, and leaving them empty keeps the
+single-user behaviour above exactly as it was.
+
+```
+https://console.cloud.google.com/apis/credentials
+  Create credentials → OAuth client ID → Web application
+  Authorised redirect URI: http://localhost:4870/api/auth/google/callback
+```
+
+What changes:
+
+* The page is **gated** until you sign in. Google is the identity provider and
+  nothing more — the scopes are `openid email profile`, no Google API is called
+  afterwards, and the token is dropped once the name, email and picture are read.
+* **Every account connects its own Deezer**, by pasting its own `arl` cookie or by
+  authorising the registered Deezer app against its own account. Connections are kept
+  per identity in `data/users.json`, and the credentials in it are encrypted
+  (AES-256-GCM) under `APP_SECRET`, or under a `data/secret.key` generated on first
+  run. A copy is always written to the Deezer account of the person who asked for it.
+* **`ALLOWED_EMAILS` is the door.** Addresses, `@whole-domains`, or both. Empty means
+  anybody with a Google account can sign in and connect their own Deezer through your
+  server — fine on localhost, a bad idea on a public URL, and the server says so at
+  startup.
+* **`PUBLIC_URL`** is the origin redirect URIs are built from; `https` there also marks
+  the session cookie `Secure`. The cookie is signed, `HttpOnly`, `SameSite=Lax` and
+  carries nothing but the identity id and an issue time, and state-changing requests
+  additionally check `Origin`.
+* **The browser-login route is refused** in this mode. One Chrome profile holds one
+  Deezer login, so offering it would let whoever signed in most recently write into
+  somebody else's library. The cookie paste and the Deezer app are per-account; the
+  shared profile is not.
+* An install that was single-user keeps working: `data/gw.json` and `data/token.json`
+  are folded into the `local` record on first start, encrypted, and removed.
+
+`DEEZER_ARL` in `.env` deliberately applies to the single-user mode only — one
+machine-wide cookie handed to whoever signs in is the same mistake as the shared
+browser profile.
 
 ## How the keyless side works
 
@@ -150,7 +193,12 @@ Measured keyless, from a cold cache: *Top 50 Global* → 49 matched / 1 rejected
 ## Layout
 
 ```
-server.js               Express routes, SSE conversion stream, picks keyed vs keyless
+server.js               Express routes, the auth gate, SSE conversion stream
+lib/auth.js             Google sign-in: authorization code flow, allow list
+lib/session.js          signed session cookies, and the origin the app answers on
+lib/users.js            one record per identity: profile + that person's Deezer
+lib/secret.js           the local key, and encryption of what lands on disk
+lib/paths.js            where the data directory is
 lib/spotify-public.js   keyless read: embed JSON, then browser scroll for >100
 lib/spotify.js          keyed read: client-credentials token, paged track reads
 lib/deezer-gw.js        keyless write: Deezer's own gateway over your web session

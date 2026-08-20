@@ -1,7 +1,7 @@
 /*
- * Local server for the Spotify -> Deezer playlist copier.
+ * Server for the Spotify -> Deezer playlist copier.
  *
- * Everything runs on this machine, and both sides work two ways:
+ * Both sides work two ways:
  *
  *   Spotify   registered app (ISRC + any length)  |  public pages, no credentials
  *   Deezer    registered app via OAuth            |  your own logged-in web session
@@ -9,6 +9,16 @@
  * The keyless route is the default; credentials are used whenever they are
  * present, because they are the stable route and the ISRC makes matching exact.
  * `resolveReader`/`resolveWriter` are the two places that choose.
+ *
+ * Who "you" are depends on one switch, GOOGLE_CLIENT_ID/SECRET:
+ *
+ *   absent   single user, this machine. The Deezer connection is the machine's,
+ *            exactly as before, under the fixed `local` identity.
+ *   present  Google sign-in is required and every Deezer connection belongs to
+ *            the account that made it - see lib/users.js. The shared Chrome
+ *            profile login is refused in this mode: one browser profile holds one
+ *            Deezer login, so offering it would let whoever signed in most
+ *            recently write into somebody else's library.
  *
  * The conversion is streamed over SSE: a 500-track playlist is minutes of
  * rate-limited Deezer lookups, and a silent three-minute POST is
@@ -23,15 +33,23 @@ import { HttpError } from './lib/http.js';
 import * as spotifyApi from './lib/spotify.js';
 import * as spotifyPublic from './lib/spotify-public.js';
 import * as deezerApi from './lib/deezer.js';
-import * as deezerSearch from './lib/deezer.js';
+import { DeezerApi } from './lib/deezer.js';
 import { GwClient, cookieTransport, browserTransport } from './lib/deezer-gw.js';
 import * as browser from './lib/browser.js';
+import * as auth from './lib/auth.js';
+import * as sessions from './lib/session.js';
+import * as users from './lib/users.js';
+import { keyIsGenerated } from './lib/secret.js';
 import { convertPlaylist } from './lib/convert.js';
 import { cache, flush } from './lib/store.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 4870;
 const DEEZER_HOME = 'https://www.deezer.com/';
+const OAUTH_COOKIE = 'sd_oauth';
+
+/** True while there is no identity provider: one machine, one user, no sign-in. */
+const singleUser = () => !auth.configured();
 
 /**
  * Which commit is running. Printed at startup and served in /api/config, because
@@ -51,16 +69,7 @@ const BUILD = (() => {
 const app = express();
 app.use(express.json({ limit: '4mb' }));
 
-// --- the pasted-cookie shortcut ------------------------------------------
-
-const GW_FILE = path.join(HERE, 'data', 'gw.json');
-let storedArl = null;
-try {
-  storedArl = JSON.parse(fs.readFileSync(GW_FILE, 'utf8')).arl || null;
-} catch { /* nothing saved */ }
-
-const arl = () => process.env.DEEZER_ARL || storedArl;
-
+const secureCookies = sessions.isHttps(PORT);
 const pendingStates = new Set();
 
 const fail = (res, err) => {
@@ -69,38 +78,173 @@ const fail = (res, err) => {
   res.status(status).json({ error: err.message });
 };
 
+// --- who is asking -------------------------------------------------------
+
+/**
+ * The identity behind a request: `{ id, identity }`, or null when sign-in is on
+ * and nobody is signed in. Everything per-user hangs off `id`.
+ */
+function whoami(req) {
+  if (singleUser()) {
+    return { id: users.LOCAL_ID, identity: { provider: 'local', name: 'this machine' } };
+  }
+  const session = sessions.fromRequest(req);
+  if (!session) return null;
+  const stored = users.get(session.sub);
+  if (!stored?.identity) return null;         // signed out server-side, or new key
+  if (!auth.allowed(stored.identity.email)) return null;   // allowlist tightened since
+  return { id: session.sub, identity: stored.identity };
+}
+
+/** Routes reachable without being signed in - the sign-in flow itself, and config. */
+const OPEN_ROUTES = new Set([
+  '/api/config',
+  '/api/auth/google',
+  '/api/auth/google/callback',
+  '/api/auth/logout',
+]);
+
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+/**
+ * A state-changing call has to come from this app's own origin. The session cookie
+ * is already SameSite=Lax, so this is the second lock rather than the only one:
+ * it costs a header comparison and it closes the fetch-from-another-page case.
+ */
+function sameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;                   // curl, or a same-origin navigation
+  try {
+    const asked = new URL(origin);
+    const declared = process.env.PUBLIC_URL || process.env.BASE_URL;
+    return declared ? asked.origin === new URL(declared).origin : asked.host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  if (!SAFE_METHODS.has(req.method) && !sameOrigin(req)) {
+    return res.status(403).json({ error: 'Refused: that request came from another site.' });
+  }
+  req.who = whoami(req);
+  if (OPEN_ROUTES.has(req.path)) return next();
+  if (!req.who) {
+    // An OAuth callback landing here is a browser navigation, not a fetch: send it
+    // to the page, which explains itself, rather than answering it with JSON.
+    if (req.method === 'GET' && String(req.headers.accept || '').includes('text/html')) {
+      return res.redirect('/?auth=required');
+    }
+    return res.status(401).set('Cache-Control', 'no-store')
+      .json({ error: 'Sign in with Google first.', signIn: true });
+  }
+  users.touch(req.who.id);
+  return next();
+});
+
+// --- Google sign-in ------------------------------------------------------
+
+app.get('/api/auth/google', (req, res) => {
+  try {
+    if (singleUser()) throw new HttpError(404, 'Google sign-in is not configured on this server.');
+    const state = crypto.randomBytes(16).toString('hex');
+    const nonce = crypto.randomBytes(16).toString('hex');
+    // The pair rides in a short-lived signed cookie rather than server memory, so
+    // a restart mid-sign-in - or a second worker - does not lose the round trip.
+    sessions.setCookie(res, OAUTH_COOKIE, sessions.sign({ sub: state, nonce, iat: Date.now() }), {
+      maxAgeMs: 10 * 60_000,
+      secure: secureCookies,
+    });
+    res.redirect(auth.authUrl({ port: PORT, state, nonce }));
+  } catch (err) { fail(res, err); }
+});
+
+app.get('/api/auth/google/callback', async (req, res) => {
+  const bounce = (params) => res.redirect(`/?${new URLSearchParams(params)}`);
+  try {
+    if (singleUser()) throw new HttpError(404, 'Google sign-in is not configured on this server.');
+    const { code, state, error: denied } = req.query;
+    sessions.clearCookie(res, OAUTH_COOKIE, { secure: secureCookies });
+    if (denied) return bounce({ auth: 'denied' });
+
+    const jar = sessions.parseCookies(req.headers.cookie);
+    const pending = sessions.verify(jar[OAUTH_COOKIE], { maxAgeMs: 10 * 60_000 });
+    if (!code || !state || !pending || pending.sub !== String(state)) {
+      return bounce({ auth: 'error', message: 'That sign-in did not come back to the browser it started in - try again.' });
+    }
+
+    const profile = await auth.exchangeCode(String(code), { port: PORT, nonce: pending.nonce });
+    if (!profile.emailVerified) {
+      return bounce({ auth: 'error', message: 'That Google account has no verified email address.' });
+    }
+    if (!auth.allowed(profile.email)) {
+      return bounce({ auth: 'denied', message: `${profile.email} is not on this server's allow list.` });
+    }
+
+    const id = users.googleId(profile.sub);
+    users.upsertIdentity(id, {
+      provider: 'google',
+      sub: profile.sub,
+      email: profile.email,
+      name: profile.name,
+      picture: profile.picture,
+    });
+    sessions.setCookie(res, sessions.COOKIE, sessions.sign({ sub: id, iat: Date.now() }), { secure: secureCookies });
+    return bounce({ auth: 'signedin' });
+  } catch (err) {
+    if (!(err instanceof HttpError)) console.error(err);
+    return bounce({ auth: 'error', message: err.message });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  // Only the cookie goes: the Deezer connection stays on the record, ready for
+  // the next sign-in. "Disconnect Deezer" is the button that forgets that.
+  sessions.clearCookie(res, sessions.COOKIE, { secure: secureCookies });
+  res.json({ ok: true });
+});
+
 // --- the two Deezer session flavours -------------------------------------
 
-// Cookie transport whenever an `arl` is available, otherwise the browser profile.
-let gw = null;
-function gwClient() {
-  if (!gw) {
-    gw = arl()
-      ? new GwClient(cookieTransport(arl()))
-      : new GwClient(browserTransport(() => browser.requestApi()));
-  }
-  return gw;
+// One gateway client per identity, keyed so a 500-track push does not re-fetch
+// the CSRF token for every batch. Dropped whenever that user's cookie changes.
+const gwClients = new Map();
+
+function gwClient(id) {
+  if (gwClients.has(id)) return gwClients.get(id);
+  const arl = users.arl(id);
+  let client = null;
+  if (arl) client = new GwClient(cookieTransport(arl));
+  else if (singleUser() && id === users.LOCAL_ID) client = new GwClient(browserTransport(() => browser.requestApi()));
+  gwClients.set(id, client);
+  return client;
 }
+
+const dropGwClient = id => gwClients.delete(id);
 
 /**
  * Who the key-free session belongs to.
  *
- * `mayOpen` allows starting the *headless* profile to answer the question - no
- * window, just the cookies already on disk. Without a profile there is nothing to
- * ask, so a first-time visitor never triggers a browser launch.
+ * `mayOpen` allows starting the *headless* browser profile to answer the question
+ * - no window, just the cookies already on disk. Without a profile there is
+ * nothing to ask, so a first-time visitor never triggers a browser launch. With
+ * sign-in on there is no browser route at all, only the pasted cookie.
  */
-async function sessionUser({ mayOpen = false } = {}) {
-  const usable = arl() || browser.sessionOpen() || (mayOpen && browser.profileExists());
-  if (!usable) return null;
+async function sessionUser(id, { mayOpen = false } = {}) {
+  const client = gwClient(id);
+  if (!client) return null;
+  const viaBrowser = !users.arl(id);
+  if (viaBrowser && !(browser.sessionOpen() || (mayOpen && browser.profileExists()))) return null;
   try {
-    return await gwClient().refresh();
+    return await client.refresh();
   } catch {
     return null;
   }
 }
 
-const gwWriter = client => ({
-  mode: arl() ? 'arl' : 'browser',
+const gwWriter = (client, mode) => ({
+  mode,
   myPlaylists: () => client.myPlaylists(),
   createPlaylist: (title, description) => client.createPlaylist(title, description),
   playlistTrackIds: id => client.playlistTrackIds(id),
@@ -120,26 +264,38 @@ const gwWriter = client => ({
   },
 });
 
-const apiWriter = () => ({
+/** That user's registered-app Deezer, or null when they have not connected one. */
+function oauthApi(id) {
+  const session = users.oauth(id);
+  if (!session) return null;
+  return new DeezerApi(session, { onExpired: () => users.disconnect(id, 'oauth') });
+}
+
+const apiWriter = api => ({
   mode: 'oauth',
-  myPlaylists: () => deezerApi.myPlaylists(),
+  myPlaylists: () => api.myPlaylists(),
   createPlaylist: async (title, description) => {
-    const made = await deezerApi.createPlaylist(title);
-    if (description) await deezerApi.setPlaylistDescription(made.id, description);
+    const made = await api.createPlaylist(title);
+    if (description) await api.setPlaylistDescription(made.id, description);
     return made;
   },
-  playlistTrackIds: id => deezerApi.playlistTrackIds(id),
-  addTracks: (id, ids) => deezerApi.addTracks(id, ids),
-  removeTracks: (id, ids) => deezerApi.removeTracks(id, ids),
+  playlistTrackIds: id => api.playlistTrackIds(id),
+  addTracks: (id, ids) => api.addTracks(id, ids),
+  removeTracks: (id, ids) => api.removeTracks(id, ids),
 });
 
-/** Registered app first when it is actually connected, else the web session. */
-async function resolveWriter() {
-  if (deezerApi.configured() && await deezerApi.currentUser()) return apiWriter();
-  if (await sessionUser({ mayOpen: true })) return gwWriter(gwClient());
-  throw new HttpError(401, arl()
+/** Registered app first when that user has connected one, else their web session. */
+async function resolveWriter(who) {
+  const api = oauthApi(who.id);
+  if (api) return apiWriter(api);
+  if (await sessionUser(who.id, { mayOpen: true })) {
+    return gwWriter(gwClient(who.id), users.arl(who.id) ? 'arl' : 'browser');
+  }
+  throw new HttpError(401, users.arl(who.id)
     ? 'That Deezer cookie is not a logged-in session any more - paste a fresh one.'
-    : 'Connect Deezer first (a browser window opens; log in there once).');
+    : singleUser()
+      ? 'Connect Deezer first (paste your session cookie, or open the browser login).'
+      : 'Connect your Deezer account first - paste your session cookie below.');
 }
 
 const resolveReader = () => (spotifyApi.configured() ? spotifyApi : spotifyPublic);
@@ -148,21 +304,43 @@ const resolveReader = () => (spotifyApi.configured() ? spotifyApi : spotifyPubli
 
 app.get('/api/config', async (req, res) => {
   try {
-    const user = await sessionUser({ mayOpen: true });
+    const who = req.who;
+    const deezer = {
+      hasKeys: deezerApi.configured(),
+      oauthUser: null,
+      sessionUser: null,
+      sessionMode: 'arl',
+      sessionOpen: false,
+      hasProfile: false,
+      browserLogin: false,
+      browserChannel: null,
+    };
+    if (who) {
+      deezer.oauthUser = oauthApi(who.id)?.user || null;
+      deezer.sessionUser = await sessionUser(who.id, { mayOpen: true });
+      // The browser profile is a single machine-wide login, so it is only ever
+      // offered when this server has one user by definition.
+      deezer.browserLogin = singleUser();
+      deezer.sessionMode = users.arl(who.id) ? 'arl' : 'browser';
+      deezer.sessionOpen = singleUser() && browser.sessionOpen();
+      deezer.hasProfile = singleUser() && browser.profileExists();
+      deezer.browserChannel = singleUser() ? (browser.pickChannel() || 'chromium') : null;
+    }
     res.set('Cache-Control', 'no-store').json({
+      auth: {
+        enabled: !singleUser(),
+        user: who && !singleUser() ? {
+          name: who.identity.name,
+          email: who.identity.email,
+          picture: who.identity.picture,
+        } : null,
+        restricted: auth.allowList().length > 0,
+      },
       spotify: {
         mode: spotifyApi.configured() ? 'api' : 'public',
         hasKeys: spotifyApi.configured(),
       },
-      deezer: {
-        hasKeys: deezerApi.configured(),
-        oauthUser: deezerApi.configured() ? await deezerApi.currentUser() : null,
-        sessionUser: user,
-        sessionMode: arl() ? 'arl' : 'browser',
-        sessionOpen: browser.sessionOpen(),
-        hasProfile: browser.profileExists(),
-        browserChannel: browser.pickChannel() || 'chromium',
-      },
+      deezer,
       redirectUri: deezerApi.redirectUri(PORT),
       cacheSize: cache.size,
       build: BUILD,
@@ -174,14 +352,18 @@ app.get('/api/config', async (req, res) => {
 
 app.post('/api/deezer/session/open', async (req, res) => {
   try {
-    if (arl()) {
-      const user = await sessionUser({ mayOpen: true });
+    if (!singleUser()) {
+      throw new HttpError(409, 'This server has more than one user, so the shared browser login is off: '
+        + 'paste your own Deezer session cookie instead.');
+    }
+    if (users.arl(req.who.id)) {
+      const user = await sessionUser(req.who.id, { mayOpen: true });
       if (!user) throw new HttpError(401, 'That Deezer cookie is not logged in.');
       return res.json({ user, opened: false });
     }
     // A stored login answers for itself headlessly; only a missing one is worth
     // putting a window on someone's screen for.
-    const known = await sessionUser({ mayOpen: true });
+    const known = await sessionUser(req.who.id, { mayOpen: true });
     if (known) return res.json({ user: known, opened: false });
 
     await browser.showPage(`${DEEZER_HOME}login`);
@@ -192,19 +374,20 @@ app.post('/api/deezer/session/open', async (req, res) => {
 app.get('/api/deezer/session/check', async (req, res) => {
   try {
     // Never opens or touches a window: the login in progress must be left alone.
-    res.set('Cache-Control', 'no-store').json({ user: await sessionUser() });
+    res.set('Cache-Control', 'no-store').json({ user: await sessionUser(req.who.id) });
   } catch (err) { fail(res, err); }
 });
 
 /**
- * The escape hatch from the login window: paste the `arl` cookie of an already
- * logged-in deezer.com. Validated before it is stored, so a bad paste says so at
- * once instead of failing later at the write.
+ * How a Deezer account gets attached to whoever is signed in: paste the `arl`
+ * cookie of an already logged-in deezer.com. Validated before it is stored, so a
+ * bad paste says so at once instead of failing later at the write, and kept
+ * encrypted under that identity only.
  */
 app.post('/api/deezer/session/arl', async (req, res) => {
   try {
     // Accept the bare value, "arl=...", or a whole document.cookie dump - people
-     // copy whichever of those the devtools panel happens to give them.
+    // copy whichever of those the devtools panel happens to give them.
     const pasted = String(req.body?.arl || '').trim();
     const value = (pasted.match(/arl=([A-Za-z0-9._-]{50,})/) || [])[1]
       || (/^[A-Za-z0-9._-]{50,}$/.test(pasted) ? pasted : '');
@@ -215,28 +398,25 @@ app.post('/api/deezer/session/arl', async (req, res) => {
     const user = await probe.refresh();
     if (!user) throw new HttpError(401, 'That cookie is not a logged-in Deezer session - copy it again from a tab where you are signed in.');
 
-    fs.mkdirSync(path.dirname(GW_FILE), { recursive: true });
-    fs.writeFileSync(GW_FILE, JSON.stringify({ arl: value }, null, 2));
-    storedArl = value;
-    gw = null;
-    await browser.closeSession();      // no window is needed any more
+    users.setArl(req.who.id, value);
+    dropGwClient(req.who.id);
+    if (singleUser()) await browser.closeSession();      // no window is needed any more
     res.json({ user });
   } catch (err) { fail(res, err); }
 });
 
 app.post('/api/deezer/session/close', async (req, res) => {
   try {
-    await browser.closeSession();   // cookies stay in the profile
+    if (singleUser()) await browser.closeSession();   // cookies stay in the profile
     res.json({ ok: true });
   } catch (err) { fail(res, err); }
 });
 
 app.post('/api/deezer/session/forget', async (req, res) => {
   try {
-    gw = null;
-    storedArl = null;
-    fs.rmSync(GW_FILE, { force: true });
-    await browser.forgetSession();
+    users.disconnect(req.who.id, 'arl');
+    dropGwClient(req.who.id);
+    if (singleUser()) await browser.forgetSession();
     res.json({ ok: true });
   } catch (err) { fail(res, err); }
 });
@@ -246,8 +426,10 @@ app.post('/api/deezer/session/forget', async (req, res) => {
 app.get('/api/deezer/login', (req, res) => {
   try {
     const state = crypto.randomBytes(16).toString('hex');
-    pendingStates.add(state);
-    setTimeout(() => pendingStates.delete(state), 10 * 60_000).unref?.();
+    // The state remembers *which* signed-in user started this, so a callback can
+    // never file somebody else's Deezer account against the wrong record.
+    pendingStates.add(`${state}:${req.who.id}`);
+    setTimeout(() => pendingStates.delete(`${state}:${req.who.id}`), 10 * 60_000).unref?.();
     res.redirect(deezerApi.authUrl({ port: PORT, state }));
   } catch (err) { fail(res, err); }
 });
@@ -256,11 +438,12 @@ app.get('/api/deezer/callback', async (req, res) => {
   const { code, state, error_reason: denied } = req.query;
   if (denied) return res.redirect('/?deezer=denied');
   if (!code) return res.redirect('/?deezer=error&message=' + encodeURIComponent('Deezer sent no code'));
-  if (!state || !pendingStates.delete(String(state))) {
+  if (!state || !pendingStates.delete(`${String(state)}:${req.who.id}`)) {
     return res.redirect('/?deezer=error&message=' + encodeURIComponent('Stale or forged callback state - try connecting again'));
   }
   try {
-    await deezerApi.exchangeCode(String(code), PORT);
+    const session = await deezerApi.exchangeCode(String(code), PORT);
+    users.setOauth(req.who.id, session);
     res.redirect('/?deezer=connected');
   } catch (err) {
     res.redirect('/?deezer=error&message=' + encodeURIComponent(err.message));
@@ -269,16 +452,16 @@ app.get('/api/deezer/callback', async (req, res) => {
 
 app.post('/api/deezer/logout', async (req, res) => {
   try {
-    await deezerApi.logout();
+    users.disconnect(req.who.id, 'oauth');
     res.json({ ok: true });
   } catch (err) { fail(res, err); }
 });
 
-// --- Deezer: reads that need no session ---------------------------------
+// --- Deezer: reads ------------------------------------------------------
 
 app.get('/api/deezer/playlists', async (req, res) => {
   try {
-    const writer = await resolveWriter();
+    const writer = await resolveWriter(req.who);
     res.set('Cache-Control', 'no-store').json({ playlists: await writer.myPlaylists() });
   } catch (err) { fail(res, err); }
 });
@@ -287,7 +470,7 @@ app.get('/api/deezer/search', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
     if (!q) throw new HttpError(400, 'Nothing to search for');
-    res.set('Cache-Control', 'no-store').json({ results: await deezerSearch.search(q, { limit: 12 }) });
+    res.set('Cache-Control', 'no-store').json({ results: await deezerApi.search(q, { limit: 12 }) });
   } catch (err) { fail(res, err); }
 });
 
@@ -335,7 +518,8 @@ app.get('/api/convert', async (req, res) => {
 // --- write to Deezer -----------------------------------------------------
 
 /**
- * Writes the chosen tracks to Deezer.
+ * Writes the chosen tracks to Deezer - always to the playlists of the identity
+ * making the request.
  *
  * `mode` only matters for an existing playlist and is deliberately explicit
  * rather than inferred: `append` keeps what is there and adds what is missing,
@@ -349,11 +533,17 @@ app.post('/api/deezer/push', async (req, res) => {
     if (!ids.length) throw new HttpError(400, 'No tracks to add');
     if (mode && !['append', 'replace'].includes(mode)) throw new HttpError(400, `Unknown write mode "${mode}"`);
     const writeMode = playlistId ? (mode || 'append') : 'new';
-    const writer = await resolveWriter();
+    const writer = await resolveWriter(req.who);
 
     let target;
     if (playlistId) {
-      target = { id: String(playlistId), link: `https://www.deezer.com/playlist/${playlistId}`, created: false };
+      // An id arrives from the browser, so it is checked against that user's own
+      // playlists rather than trusted: writing into a playlist id you were handed
+      // is exactly what must not be possible on a shared server.
+      const own = await writer.myPlaylists();
+      const mine = own.find(p => String(p.id) === String(playlistId));
+      if (!mine) throw new HttpError(403, 'That playlist is not one of yours.');
+      target = { id: String(mine.id), link: mine.link || `https://www.deezer.com/playlist/${mine.id}`, created: false };
     } else {
       const name = String(title || '').trim() || 'Imported from Spotify';
       const made = await writer.createPlaylist(name, String(description || '').slice(0, 500));
@@ -391,10 +581,26 @@ app.post('/api/deezer/push', async (req, res) => {
 
 app.use(express.static(path.join(HERE, 'public'), { extensions: ['html'] }));
 
+if (singleUser()) users.migrateLegacy({ log: line => console.log(line) });
+
 app.listen(PORT, () => {
-  console.log(`Spotify -> Deezer running on http://localhost:${PORT}  (build ${BUILD})`);
+  console.log(`Spotify -> Deezer running on ${sessions.baseUrl(PORT)}  (build ${BUILD})`);
+  console.log(`   Sign-in: ${singleUser() ? 'off - single user, this machine' : 'Google'}`);
   console.log(`   Spotify: ${spotifyApi.configured() ? 'app credentials (exact ISRC matching)' : 'no credentials - reading public pages'}`);
-  console.log(`   Deezer:  ${deezerApi.configured() ? 'app credentials available' : arl() ? 'saved cookie session' : 'browser login (no credentials needed)'}`);
+  console.log(`   Deezer:  ${deezerApi.configured() ? 'app credentials available' : 'per-user session cookie'}`);
+  if (!singleUser()) {
+    if (!auth.allowList().length) {
+      console.log('   ! ALLOWED_EMAILS is empty: anybody with a Google account can sign in and');
+      console.log('     connect their own Deezer. Set it to a list of addresses or @domains.');
+    }
+    if (keyIsGenerated()) {
+      console.log('   ! APP_SECRET is unset: sessions and stored Deezer cookies are keyed off');
+      console.log('     data/secret.key. Losing that file signs everybody out.');
+    }
+    if (!process.env.PUBLIC_URL && !process.env.BASE_URL) {
+      console.log(`   ! PUBLIC_URL is unset, so redirect URIs are built as ${sessions.baseUrl(PORT)}`);
+    }
+  }
 });
 
 for (const sig of ['SIGINT', 'SIGTERM']) {

@@ -9,6 +9,11 @@
  * Connecting Deezer without app credentials is a two-step affair - open a browser
  * window, then wait for the login to happen in it - so that button starts a poll
  * rather than awaiting a single request.
+ *
+ * Two shapes of the same page, decided by the server's `auth.enabled`: a local
+ * single-user tool, or a signed-in one where the page is gated until Google says
+ * who you are and every Deezer connection is your own. `body.gated` is what hides
+ * the working parts in the second case.
  */
 
 const $ = sel => document.querySelector(sel);
@@ -46,20 +51,63 @@ function toast(message, bad = false) {
   toastTimer = setTimeout(() => t.classList.add('hidden'), bad ? 8000 : 4000);
 }
 
-const post = (url, body) => fetch(url, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: body ? JSON.stringify(body) : undefined,
-}).then(r => r.json());
+const post = async (url, body) => {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({ error: `The server answered ${res.status}` }));
+  // A session that expired while the page was open should put the sign-in gate
+  // back rather than let every button fail with the same 401.
+  if (res.status === 401 && data.signIn) loadConfig();
+  return data;
+};
 
 // --- account -------------------------------------------------------------
+
+/** The Google half of the header: who you are, and the way out. */
+function renderMe(auth) {
+  const box = $('#me');
+  box.replaceChildren();
+  if (!auth.enabled || !auth.user) return;
+  if (auth.user.picture) {
+    const img = el('img');
+    img.src = auth.user.picture;
+    img.alt = '';
+    img.referrerPolicy = 'no-referrer';   // Google's CDN 403s a referred request
+    box.append(img);
+  }
+  box.append(el('span', null, auth.user.name));
+  if (auth.user.email && auth.user.email !== auth.user.name) box.append(el('span', 'muted', auth.user.email));
+  const out = el('button', 'ghost', 'Sign out');
+  out.onclick = async () => {
+    await post('/api/auth/logout');
+    location.href = '/';
+  };
+  box.append(out);
+}
 
 async function loadConfig() {
   const cfg = await fetch('/api/config').then(r => r.json());
   state.cfg = cfg;
+  const auth = cfg.auth || { enabled: false, user: null };
   const dz = cfg.deezer;
   const user = dz.oauthUser || dz.sessionUser;
   state.deezerReady = Boolean(user);
+
+  renderMe(auth);
+  const gated = auth.enabled && !auth.user;
+  document.body.classList.toggle('gated', gated);
+  $('#signin-card').classList.toggle('hidden', !gated);
+  $('#build').textContent = `build ${cfg.build || '?'}`;
+  if (gated) {
+    $('#signin-note').textContent = auth.restricted
+      ? 'This server only accepts the accounts on its allow list.'
+      : '';
+    $('#account').replaceChildren();
+    return cfg;
+  }
 
   const box = $('#account');
   box.replaceChildren();
@@ -84,10 +132,14 @@ async function loadConfig() {
     loadTargets();
   } else {
     box.append(el('span', 'dot'), el('span', null, 'Deezer: not connected'));
-    const login = el('button', 'ghost', 'try browser login');
-    login.title = 'Deezer usually refuses to sign in inside an automated browser - the cookie below is the reliable route';
-    login.onclick = () => connectSession(login);
-    box.append(login);
+    // The browser profile holds one machine-wide Deezer login, so the server only
+    // offers it when it has a single user by definition.
+    if (dz.browserLogin) {
+      const login = el('button', 'ghost', 'try browser login');
+      login.title = 'Deezer usually refuses to sign in inside an automated browser - the cookie below is the reliable route';
+      login.onclick = () => connectSession(login);
+      box.append(login);
+    }
     if (dz.hasKeys) {
       const oauth = el('button', 'ghost', 'use app keys');
       oauth.onclick = () => { location.href = '/api/deezer/login'; };
@@ -95,9 +147,19 @@ async function loadConfig() {
     }
   }
 
-  // The cookie shortcut is only worth showing while there is nothing connected.
-  $('#arl-card').classList.toggle('hidden', Boolean(user) || dz.sessionMode === 'arl');
-  $('#build').textContent = `build ${cfg.build || '?'}`;
+  // The cookie box stays up until something is actually connected: a stored
+  // cookie that has stopped working is exactly when it is needed most.
+  $('#arl-card').classList.toggle('hidden', Boolean(user));
+  $('#arl-storage').textContent = auth.enabled
+    ? 'It is stored encrypted against your account on this server, and used only for your own copies.'
+    : 'It is stored encrypted in data/users.json on this machine.';
+  $('#arl-browser-note').textContent = dz.browserLogin
+    ? 'Deezer will not complete a login inside an automated browser - its form silently re-renders '
+      + 'instead of signing you in - so the "try browser login" button up there is a long shot. This '
+      + 'cookie is the reliable way in. App credentials in .env also work if you would rather register an app.'
+    : dz.hasKeys
+      ? 'Or use "use app keys" up there to authorise this app against your Deezer account instead.'
+      : '';
 
   $('#source-hint').textContent = cfg.spotify.hasKeys
     ? 'Reading with your Spotify app credentials: exact ISRC matching, any playlist length. Spotify’s own editorial playlists (Discover Weekly, Release Radar) are invisible to app tokens.'
@@ -528,6 +590,7 @@ async function saveArl() {
   }
 }
 
+$('#google-signin').onclick = () => { location.href = '/api/auth/google'; };
 $('#arl-save').onclick = saveArl;
 $('#arl').addEventListener('keydown', e => { if (e.key === 'Enter') saveArl(); });
 $('#go').onclick = start;
@@ -582,7 +645,11 @@ const params = new URLSearchParams(location.search);
 if (params.get('deezer') === 'connected') toast('Connected to Deezer');
 if (params.get('deezer') === 'denied') toast('Deezer authorisation was declined', true);
 if (params.get('deezer') === 'error') toast(params.get('message') || 'Deezer connection failed', true);
-if (params.has('deezer')) history.replaceState({}, '', location.pathname);
+if (params.get('auth') === 'signedin') toast('Signed in');
+if (params.get('auth') === 'required') toast('Sign in first', true);
+if (params.get('auth') === 'denied') toast(params.get('message') || 'That Google account cannot use this server', true);
+if (params.get('auth') === 'error') toast(params.get('message') || 'Google sign-in failed', true);
+if (params.has('deezer') || params.has('auth')) history.replaceState({}, '', location.pathname);
 
 loadConfig();
 syncDest();

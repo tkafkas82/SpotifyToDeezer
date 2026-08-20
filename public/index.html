@@ -86,13 +86,32 @@
   <div class="dock-inner">
     <div class="dock-count"><strong id="sel-count">0</strong> <span id="sel-label">tracks selected</span></div>
     <div class="dock-target">
-      <select id="target">
-        <option value="">New Deezer playlist&hellip;</option>
-      </select>
-      <input id="new-name" type="text" placeholder="Playlist name">
+      <div class="seg" id="dest">
+        <button type="button" data-dest="new" class="chip on">New playlist</button>
+        <button type="button" data-dest="existing" class="chip">Existing playlist</button>
+      </div>
+
+      <div class="dest-fields" id="dest-new">
+        <input id="new-name" type="text" placeholder="Playlist name">
+        <button type="button" id="use-sp-name" class="ghost"
+                title="Name it after the Spotify playlist">Spotify name</button>
+      </div>
+
+      <div class="dest-fields hidden" id="dest-existing">
+        <select id="target">
+          <option value="">Pick a playlist&hellip;</option>
+        </select>
+        <div class="seg" id="write-mode">
+          <button type="button" data-mode="append" class="chip on"
+                  title="Keep what is in it and add the tracks it does not have">Append</button>
+          <button type="button" data-mode="replace" class="chip"
+                  title="Empty the playlist first, then add these tracks">Replace</button>
+        </div>
+      </div>
     </div>
     <button id="push" class="primary">Add to Deezer</button>
   </div>
+  <div id="dock-hint" class="dock-hint hidden"></div>
   <div id="push-result" class="push-result hidden"></div>
 </footer>
 

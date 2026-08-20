@@ -168,9 +168,18 @@ footer#dock {
   flex-wrap: wrap;
 }
 .dock-count { color: var(--muted); font-size: 13px; }
-.dock-target { display: flex; gap: 8px; flex: 1 1 360px; min-width: 0; }
+.dock-target { display: flex; gap: 10px; flex: 1 1 420px; min-width: 0; align-items: center; flex-wrap: wrap; }
 .dock-target select { flex: 0 1 220px; }
-.dock-target input { flex: 1 1 180px; min-width: 0; }
+.dock-target input { flex: 1 1 160px; min-width: 0; }
+.dest-fields { display: flex; gap: 8px; align-items: center; flex: 1 1 260px; min-width: 0; }
+
+/* segmented chips: one of these is always the chosen one */
+.seg { display: flex; }
+.seg .chip { border-radius: 0; margin-left: -1px; }
+.seg .chip:first-child { border-radius: 9px 0 0 9px; margin-left: 0; }
+.seg .chip:last-child { border-radius: 0 9px 9px 0; }
+
+.dock-hint { max-width: 1080px; margin: 0 auto; padding: 0 20px 10px; color: var(--muted); font-size: 12.5px; }
 .push-result { max-width: 1080px; margin: 0 auto; padding: 0 20px 12px; font-size: 14px; }
 .push-result a { color: var(--dz); }
 

@@ -25,6 +25,10 @@ const state = {
   filter: 'all',
   deezerReady: false,
   cfg: null,
+  targets: [],         // the Deezer playlists that can be written to
+  dest: 'new',         // 'new' = copy into a fresh playlist, 'existing' = write into one
+  writeMode: 'append', // only meaningful for 'existing': 'append' | 'replace'
+  namedByHand: false,  // has the name box been typed into for this run?
 };
 
 const mmss = ms => {
@@ -143,17 +147,61 @@ async function loadTargets() {
   try {
     const { playlists, error } = await fetch('/api/deezer/playlists').then(r => r.json());
     if (error) return;
+    state.targets = playlists || [];
     const sel = $('#target');
     const keep = sel.value;
-    sel.replaceChildren(new Option('New Deezer playlist...', ''));
-    for (const p of playlists || []) sel.append(new Option(`${p.title} (${p.nbTracks})`, p.id));
+    sel.replaceChildren(new Option('Pick a playlist...', ''));
+    for (const p of state.targets) sel.append(new Option(`${p.title} (${p.nbTracks})`, p.id));
     sel.value = keep;
-    syncTargetInputs();
+    syncDest();
   } catch { /* not connected yet - the dock stays on "new playlist" */ }
 }
 
-function syncTargetInputs() {
-  $('#new-name').classList.toggle('hidden', Boolean($('#target').value));
+/**
+ * Destination is a choice the user makes, never one inferred from which field
+ * happens to be filled in: "new playlist" and "add to this existing one" do very
+ * different things to a playlist that took an afternoon to build.
+ */
+function syncDest() {
+  const existing = state.dest === 'existing';
+  $('#dest-new').classList.toggle('hidden', existing);
+  $('#dest-existing').classList.toggle('hidden', !existing);
+  [...$('#dest').children].forEach(b => b.classList.toggle('on', b.dataset.dest === state.dest));
+  [...$('#write-mode').children].forEach(b => b.classList.toggle('on', b.dataset.mode === state.writeMode));
+
+  const chosen = state.targets.find(p => String(p.id) === $('#target').value);
+  $('#push').textContent = !existing
+    ? 'Copy to new playlist'
+    : state.writeMode === 'replace' ? 'Replace contents' : 'Add to playlist';
+
+  // The name collision is the trap worth calling out: copying a playlist a second
+  // time into a "new" playlist leaves two Deezer lists with one name, which reads
+  // exactly like the first one having been overwritten.
+  const hint = $('#dock-hint');
+  const name = $('#new-name').value.trim();
+  const twin = !existing && name && state.targets.find(p => p.title.toLowerCase() === name.toLowerCase());
+  if (twin) {
+    hint.textContent = `You already have a Deezer playlist called "${twin.title}" (${twin.nbTracks} tracks). `
+      + 'This makes a second one with the same name - pick "Existing playlist" to add to that one instead.';
+  } else if (existing && chosen && state.writeMode === 'replace') {
+    hint.textContent = `"${chosen.title}" will be emptied first - its ${chosen.nbTracks} `
+      + `track${chosen.nbTracks === 1 ? '' : 's'} are removed, then these are added.`;
+  } else if (existing && chosen) {
+    hint.textContent = `Added to the end of "${chosen.title}" - the ${chosen.nbTracks} `
+      + `track${chosen.nbTracks === 1 ? '' : 's'} in it stay, and anything already there is skipped.`;
+  } else {
+    hint.textContent = '';
+  }
+  hint.classList.toggle('hidden', !hint.textContent);
+}
+
+/** Fills the name box from the Spotify playlist, as it does on a first run. */
+function nameFromSpotify() {
+  const name = state.playlist?.name;
+  if (!name) return;
+  $('#new-name').value = name;
+  state.namedByHand = false;
+  syncDest();
 }
 
 // --- conversion ----------------------------------------------------------
@@ -176,6 +224,7 @@ function resetRun() {
 function start() {
   const url = $('#url').value.trim();
   if (!url) return toast('Paste a Spotify playlist link first', true);
+  state.namedByHand = false;
   resetRun();
   $('#go').disabled = true;
 
@@ -194,7 +243,9 @@ function start() {
     $('#pl-meta').textContent = [p.owner, `${p.count} tracks`, p.source === 'browser' ? 'read in a browser' : null]
       .filter(Boolean).join(' - ');
     if (p.warning) toast(p.warning, true);
-    if (!$('#new-name').value) $('#new-name').value = p.name;
+    // Every run gets the name of the playlist it is copying - carrying the
+    // previous one over is how a copy ends up filed under the wrong title.
+    nameFromSpotify();
     buildRows(p.count);
     $('#step-results').classList.remove('hidden');
     $('#dock').classList.remove('hidden');
@@ -388,15 +439,26 @@ async function push() {
   if (!chosen.length) return;
   if (!state.deezerReady) return toast('Connect Deezer first', true);
 
-  const playlistId = $('#target').value;
+  const existing = state.dest === 'existing';
+  const playlistId = existing ? $('#target').value : '';
+  if (existing && !playlistId) return toast('Pick which Deezer playlist to write to', true);
+
+  const target = state.targets.find(p => String(p.id) === playlistId);
+  if (existing && state.writeMode === 'replace' && !confirm(
+    `Remove the ${target?.nbTracks ?? ''} track${target?.nbTracks === 1 ? '' : 's'} currently in `
+    + `"${target?.title || 'that playlist'}" and put these ${chosen.length} in their place?`,
+  )) return;
+
   const title = $('#new-name').value.trim() || state.playlist?.name || 'Imported from Spotify';
+  const label = $('#push').textContent;
   $('#push').disabled = true;
-  $('#push').textContent = 'Adding...';
+  $('#push').textContent = existing && state.writeMode === 'replace' ? 'Replacing...' : 'Adding...';
 
   try {
     const res = await post('/api/deezer/push', {
       trackIds: chosen.map(t => t.best.id),
       playlistId: playlistId || undefined,
+      mode: existing ? state.writeMode : undefined,
       title,
       description: state.playlist ? `Copied from Spotify: ${state.playlist.name}` : undefined,
     });
@@ -408,9 +470,12 @@ async function push() {
     link.href = res.link;
     link.target = '_blank';
     link.rel = 'noreferrer';
+    const note = res.removed
+      ? ` (${res.removed} removed first)`
+      : res.duplicatesSkipped ? ` (${res.duplicatesSkipped} already there)` : '';
     box.append(
       el('span', null, `Added ${res.added} track${res.added === 1 ? '' : 's'}`),
-      res.duplicatesSkipped ? el('span', 'muted', ` (${res.duplicatesSkipped} already there)`) : el('span'),
+      note ? el('span', 'muted', note) : el('span'),
       el('span', null, ' - '),
       link,
     );
@@ -421,7 +486,8 @@ async function push() {
     toast(err.message, true);
   } finally {
     $('#push').disabled = false;
-    $('#push').textContent = 'Add to Deezer';
+    $('#push').textContent = label;
+    syncDest();
   }
 }
 
@@ -468,7 +534,27 @@ $('#go').onclick = start;
 $('#url').addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
 $('#push').onclick = push;
 $('#csv').onclick = exportCsv;
-$('#target').onchange = syncTargetInputs;
+$('#target').onchange = syncDest;
+$('#use-sp-name').onclick = () => {
+  if (!state.playlist) return toast('Match a Spotify playlist first', true);
+  state.dest = 'new';
+  nameFromSpotify();
+};
+$('#new-name').addEventListener('input', () => { state.namedByHand = true; syncDest(); });
+$('#dest').onclick = e => {
+  const btn = e.target.closest('[data-dest]');
+  if (!btn) return;
+  state.dest = btn.dataset.dest;
+  // Coming back to a fresh copy with an untouched box means the Spotify name.
+  if (state.dest === 'new' && !state.namedByHand) nameFromSpotify();
+  syncDest();
+};
+$('#write-mode').onclick = e => {
+  const btn = e.target.closest('[data-mode]');
+  if (!btn) return;
+  state.writeMode = btn.dataset.mode;
+  syncDest();
+};
 $('#picker-search').onclick = pickerSearch;
 $('#picker-q').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); pickerSearch(); } });
 
@@ -499,4 +585,4 @@ if (params.get('deezer') === 'error') toast(params.get('message') || 'Deezer con
 if (params.has('deezer')) history.replaceState({}, '', location.pathname);
 
 loadConfig();
-syncTargetInputs();
+syncDest();

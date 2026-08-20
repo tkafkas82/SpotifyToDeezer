@@ -111,6 +111,13 @@ const gwWriter = client => ({
     }
     return added;
   },
+  removeTracks: async (id, ids) => {
+    let removed = 0;
+    for (let i = 0; i < ids.length; i += 200) {
+      removed += await client.removeSongs(id, ids.slice(i, i + 200));
+    }
+    return removed;
+  },
 });
 
 const apiWriter = () => ({
@@ -123,6 +130,7 @@ const apiWriter = () => ({
   },
   playlistTrackIds: id => deezerApi.playlistTrackIds(id),
   addTracks: (id, ids) => deezerApi.addTracks(id, ids),
+  removeTracks: (id, ids) => deezerApi.removeTracks(id, ids),
 });
 
 /** Registered app first when it is actually connected, else the web session. */
@@ -326,11 +334,21 @@ app.get('/api/convert', async (req, res) => {
 
 // --- write to Deezer -----------------------------------------------------
 
+/**
+ * Writes the chosen tracks to Deezer.
+ *
+ * `mode` only matters for an existing playlist and is deliberately explicit
+ * rather than inferred: `append` keeps what is there and adds what is missing,
+ * `replace` empties the playlist first. Guessing between those two is how a copy
+ * quietly turns into a wipe.
+ */
 app.post('/api/deezer/push', async (req, res) => {
   try {
-    const { trackIds, playlistId, title, description } = req.body || {};
+    const { trackIds, playlistId, title, description, mode } = req.body || {};
     const ids = [...new Set((Array.isArray(trackIds) ? trackIds : []).map(String).filter(Boolean))];
     if (!ids.length) throw new HttpError(400, 'No tracks to add');
+    if (mode && !['append', 'replace'].includes(mode)) throw new HttpError(400, `Unknown write mode "${mode}"`);
+    const writeMode = playlistId ? (mode || 'append') : 'new';
     const writer = await resolveWriter();
 
     let target;
@@ -342,17 +360,29 @@ app.post('/api/deezer/push', async (req, res) => {
       target = { ...made, created: true };
     }
 
-    // Appending to an existing playlist should not duplicate what is already
-    // there - Deezer happily stores the same track twice otherwise.
-    const existing = target.created ? new Set() : await writer.playlistTrackIds(target.id);
-    const fresh = ids.filter(x => !existing.has(String(x)));
+    let removed = 0;
+    let fresh = ids;
+    if (!target.created) {
+      const existing = await writer.playlistTrackIds(target.id);
+      if (writeMode === 'replace') {
+        // Everything goes, including tracks that are about to be added back, so
+        // the playlist ends up in the order of this copy rather than interleaved.
+        if (existing.size) removed = await writer.removeTracks(target.id, [...existing]);
+      } else {
+        // Appending should not duplicate what is already there - Deezer stores
+        // the same track twice happily enough, and rejects the batch for trying.
+        fresh = ids.filter(x => !existing.has(String(x)));
+      }
+    }
 
     const added = fresh.length ? await writer.addTracks(target.id, fresh) : 0;
     res.json({
       playlistId: target.id,
       link: target.link,
       created: target.created,
+      mode: writeMode,
       added,
+      removed,
       duplicatesSkipped: ids.length - fresh.length,
       via: writer.mode,
     });

@@ -72,6 +72,16 @@ Two ways in, same calls: plain Node carrying the pasted `arl` cookie (the route 
 works), or the cookie jar of a browser profile logged in through the **try browser
 login** window (the route Deezer's bot defences currently close off).
 
+Three of its argument quirks are worth knowing, all confirmed against a scratch
+playlist rather than guessed: `songs` is a list of `[trackId, 0]` pairs where the
+second element is *not* a position; `offset: -1` appends at the end while `offset: 0`
+inserts the batch *above* everything already in the playlist (which reads as the
+playlist having been replaced); and one already-present track rejects the whole batch
+with `ERROR_DATA_EXISTS`, so a rejected batch is resent without the tracks the
+playlist already has. Removal is `playlist.deleteSongs`, and it needs the same pair
+shape — a flat list of ids answers `true` and removes nothing. `playlist.updateSongs`
+does not exist.
+
 Being undocumented, that gateway can change without notice — `lib/deezer.js` (the
 registered-app path) is the stable route, `lib/deezer-gw.js` the no-setup one.
 
@@ -126,9 +136,15 @@ Measured keyless, from a cold cache: *Top 50 Global* → 49 matched / 1 rejected
 1. Paste the link → **Match tracks**. Results stream in as they resolve.
 2. Filter to **Needs review** and work through them: **change** offers the other
    candidates plus a free Deezer search box, **find** does the same for the misses.
-3. Pick the destination — a new playlist (name prefilled from Spotify) or an existing
-   one — and hit **Add to Deezer**. Appending skips tracks already in the playlist,
-   so re-running is safe.
+3. Pick the destination, which is always an explicit choice rather than something
+   inferred:
+   * **New playlist** — a fresh Deezer playlist, named after the Spotify one. Every
+     match run refills that box from Spotify, so a second copy is never filed under
+     the previous playlist's name; **Spotify name** puts it back if you overtype it.
+     A warning appears if you already have a Deezer playlist by that name.
+   * **Existing playlist** → **Append** adds to the *end* and skips tracks already
+     in there, so re-running is safe. **Replace** empties the playlist first and
+     asks before it does.
 4. **Export CSV** dumps the whole match table, including what was not found.
 
 ## Layout

@@ -76,7 +76,7 @@ test('NEED_USER_AUTH_REQUIRED surfaces as a 401, not a generic failure', async (
   );
 });
 
-test('tracks are sent as [id, position] pairs, and the offset variant is retried', async () => {
+test('tracks are appended at the end, and the offset variant is retried', async () => {
   const { transport, calls } = fake({
     'deezer.getUserData': userData(1),
     // Some Deezer builds reject the `offset` field; the client must try it both ways.
@@ -87,9 +87,47 @@ test('tracks are sent as [id, position] pairs, and the offset variant is retried
   const added = await new GwClient(transport).addSongs('55', ['11', '22']);
   assert.equal(added, 2);
   const attempts = calls.filter(c => c.method === 'playlist.addSongs');
-  assert.deepEqual(attempts[0].payload.songs, [['11', 0], ['22', 1]]);
-  assert.equal(attempts[0].payload.offset, 0);
+  assert.deepEqual(attempts[0].payload.songs, [['11', 0], ['22', 0]]);
+  // -1, not 0: offset 0 inserts the batch above everything already in the playlist.
+  assert.equal(attempts[0].payload.offset, -1);
   assert.ok(!('offset' in attempts[1].payload));
+});
+
+test('a batch rejected for an existing track is resent without the ones already there', async () => {
+  const { transport, calls } = fake({
+    'deezer.getUserData': userData(1),
+    'playlist.getSongs': { error: [], results: { data: [{ SNG_ID: '11' }] } },
+    'playlist.addSongs': n => (n === 1
+      ? { error: { ERROR_DATA_EXISTS: 'This song already exists in this playlist' }, results: {} }
+      : { error: [], results: true }),
+  });
+  const added = await new GwClient(transport).addSongs('55', ['11', '22']);
+  assert.equal(added, 1);
+  const attempts = calls.filter(c => c.method === 'playlist.addSongs');
+  assert.deepEqual(attempts[1].payload.songs, [['22', 0]]);
+  assert.equal(attempts[1].payload.offset, -1);
+});
+
+test('a batch of nothing but tracks already there is a no-op, not an error', async () => {
+  const { transport, calls } = fake({
+    'deezer.getUserData': userData(1),
+    'playlist.getSongs': { error: [], results: { data: [{ SNG_ID: '11' }] } },
+    'playlist.addSongs': { error: { ERROR_DATA_EXISTS: 'This song already exists' }, results: {} },
+  });
+  assert.equal(await new GwClient(transport).addSongs('55', ['11', '11']), 0);
+  assert.equal(calls.filter(c => c.method === 'playlist.addSongs').length, 1);
+});
+
+test('removals are sent as [id, 0] pairs - a flat id list removes nothing', async () => {
+  const { transport, calls } = fake({
+    'deezer.getUserData': userData(1),
+    'playlist.deleteSongs': { error: [], results: true },
+  });
+  const removed = await new GwClient(transport).removeSongs('55', ['11', '22', '11']);
+  assert.equal(removed, 2);
+  const [call] = calls.filter(c => c.method === 'playlist.deleteSongs');
+  assert.deepEqual(call.payload.songs, [['11', 0], ['22', 0]]);
+  assert.equal(call.payload.playlist_id, '55');
 });
 
 test('an unknown gateway method is reported as a gateway error', async () => {

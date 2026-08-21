@@ -20,6 +20,13 @@
  *            Deezer login, so offering it would let whoever signed in most
  *            recently write into somebody else's library.
  *
+ * Where the records live is a separate question from who they belong to, and it
+ * is answered by the environment: data/users.json on a machine with a disk, Redis
+ * over HTTP when KV_REST_API_URL is set, which is what makes a serverless
+ * deployment possible. Nothing per-user is held between requests - two instances
+ * of this app must not disagree about who owns which Deezer - so the record is
+ * loaded once per request and hung on `req.who`.
+ *
  * The conversion is streamed over SSE: a 500-track playlist is minutes of
  * rate-limited Deezer lookups, and a silent three-minute POST is
  * indistinguishable from a hang.
@@ -47,6 +54,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 4870;
 const DEEZER_HOME = 'https://www.deezer.com/';
 const OAUTH_COOKIE = 'sd_oauth';
+const DEEZER_OAUTH_COOKIE = 'sd_deezer_oauth';
 
 /** True while there is no identity provider: one machine, one user, no sign-in. */
 const singleUser = () => !auth.configured();
@@ -70,7 +78,6 @@ const app = express();
 app.use(express.json({ limit: '4mb' }));
 
 const secureCookies = sessions.isHttps(PORT);
-const pendingStates = new Set();
 
 const fail = (res, err) => {
   const status = err instanceof HttpError ? err.status : 502;
@@ -81,19 +88,17 @@ const fail = (res, err) => {
 // --- who is asking -------------------------------------------------------
 
 /**
- * The identity behind a request: `{ id, identity }`, or null when sign-in is on
- * and nobody is signed in. Everything per-user hangs off `id`.
+ * The record behind a request, or null when sign-in is on and nobody is signed in.
+ * Everything per-user goes through the returned account.
  */
-function whoami(req) {
-  if (singleUser()) {
-    return { id: users.LOCAL_ID, identity: { provider: 'local', name: 'this machine' } };
-  }
+async function whoami(req) {
+  if (singleUser()) return users.load(users.LOCAL_ID);
   const session = sessions.fromRequest(req);
   if (!session) return null;
-  const stored = users.get(session.sub);
-  if (!stored?.identity) return null;         // signed out server-side, or new key
-  if (!auth.allowed(stored.identity.email)) return null;   // allowlist tightened since
-  return { id: session.sub, identity: stored.identity };
+  const account = await users.load(session.sub);
+  if (!account.identity) return null;              // signed out server-side, or new key
+  if (!auth.allowed(account.email)) return null;   // allow list tightened since
+  return account;
 }
 
 /** Routes reachable without being signed in - the sign-in flow itself, and config. */
@@ -123,12 +128,18 @@ function sameOrigin(req) {
   }
 }
 
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
   if (!SAFE_METHODS.has(req.method) && !sameOrigin(req)) {
     return res.status(403).json({ error: 'Refused: that request came from another site.' });
   }
-  req.who = whoami(req);
+  try {
+    req.who = await whoami(req);
+  } catch (err) {
+    // The store being unreachable is not the caller's fault, and answering 401
+    // would send them round the sign-in loop for nothing.
+    return fail(res, err);
+  }
   if (OPEN_ROUTES.has(req.path)) return next();
   if (!req.who) {
     // An OAuth callback landing here is a browser navigation, not a fetch: send it
@@ -139,7 +150,7 @@ app.use((req, res, next) => {
     return res.status(401).set('Cache-Control', 'no-store')
       .json({ error: 'Sign in with Google first.', signIn: true });
   }
-  users.touch(req.who.id);
+  req.who.touch().catch(() => {});    // last-seen is not worth failing a request over
   return next();
 });
 
@@ -183,7 +194,8 @@ app.get('/api/auth/google/callback', async (req, res) => {
     }
 
     const id = users.googleId(profile.sub);
-    users.upsertIdentity(id, {
+    const account = await users.load(id);
+    await account.signedIn({
       provider: 'google',
       sub: profile.sub,
       email: profile.email,
@@ -207,39 +219,59 @@ app.post('/api/auth/logout', (req, res) => {
 
 // --- the two Deezer session flavours -------------------------------------
 
-// One gateway client per identity, keyed so a 500-track push does not re-fetch
-// the CSRF token for every batch. Dropped whenever that user's cookie changes.
+/*
+ * One gateway client per Deezer session, so a 500-track push does not re-fetch the
+ * CSRF token for every batch of 200.
+ *
+ * Keyed by a fingerprint of the cookie rather than by identity: a cookie replaced
+ * on another instance of this app - or in another request - must not keep being
+ * answered by the client built around the old one. That makes the cache
+ * self-invalidating, which matters when there is no way to tell the other instance
+ * anything.
+ */
 const gwClients = new Map();
+const fingerprint = value => crypto.createHash('sha256').update(value).digest('base64url').slice(0, 12);
 
-function gwClient(id) {
-  if (gwClients.has(id)) return gwClients.get(id);
-  const arl = users.arl(id);
+function gwClient(account) {
+  const arl = account.arl();
+  const key = arl ? `${account.id}:${fingerprint(arl)}` : `${account.id}:browser`;
+  if (gwClients.has(key)) return gwClients.get(key);
+
   let client = null;
   if (arl) client = new GwClient(cookieTransport(arl));
-  else if (singleUser() && id === users.LOCAL_ID) client = new GwClient(browserTransport(() => browser.requestApi()));
-  gwClients.set(id, client);
+  else if (singleUser() && account.id === users.LOCAL_ID) {
+    client = new GwClient(browserTransport(() => browser.requestApi()));
+  }
+  // A long-lived process with many users would otherwise accumulate one entry per
+  // cookie ever seen. There is nothing in a client worth keeping.
+  if (gwClients.size > 64) gwClients.clear();
+  gwClients.set(key, client);
   return client;
 }
 
-const dropGwClient = id => gwClients.delete(id);
-
 /**
- * Who the key-free session belongs to.
+ * Who the key-free session belongs to: `{ user }`, or `{ user: null, error }`.
+ *
+ * The distinction matters more than it looks. A cookie Deezer has stopped
+ * honouring comes back as a session with no user, and the answer to that really is
+ * "paste a fresh one". Deezer failing to answer at all - a throttle, an edge
+ * serving HTML - throws instead, and telling somebody to re-copy a cookie that is
+ * perfectly good sends them on a wild goose chase.
  *
  * `mayOpen` allows starting the *headless* browser profile to answer the question
  * - no window, just the cookies already on disk. Without a profile there is
  * nothing to ask, so a first-time visitor never triggers a browser launch. With
  * sign-in on there is no browser route at all, only the pasted cookie.
  */
-async function sessionUser(id, { mayOpen = false } = {}) {
-  const client = gwClient(id);
-  if (!client) return null;
-  const viaBrowser = !users.arl(id);
-  if (viaBrowser && !(browser.sessionOpen() || (mayOpen && browser.profileExists()))) return null;
+async function deezerSession(account, { mayOpen = false } = {}) {
+  const client = gwClient(account);
+  if (!client) return { user: null };
+  const viaBrowser = !account.arl();
+  if (viaBrowser && !(browser.sessionOpen() || (mayOpen && browser.profileExists()))) return { user: null };
   try {
-    return await client.refresh();
-  } catch {
-    return null;
+    return { user: await client.refresh() };
+  } catch (err) {
+    return { user: null, error: err };
   }
 }
 
@@ -265,10 +297,14 @@ const gwWriter = (client, mode) => ({
 });
 
 /** That user's registered-app Deezer, or null when they have not connected one. */
-function oauthApi(id) {
-  const session = users.oauth(id);
+function oauthApi(account) {
+  const session = account.oauth();
   if (!session) return null;
-  return new DeezerApi(session, { onExpired: () => users.disconnect(id, 'oauth') });
+  return new DeezerApi(session, {
+    // Deezer has stopped accepting it; leaving it on the record would show a
+    // connection that cannot write.
+    onExpired: () => { account.disconnect('oauth').catch(() => {}); },
+  });
 }
 
 const apiWriter = api => ({
@@ -286,12 +322,15 @@ const apiWriter = api => ({
 
 /** Registered app first when that user has connected one, else their web session. */
 async function resolveWriter(who) {
-  const api = oauthApi(who.id);
+  const api = oauthApi(who);
   if (api) return apiWriter(api);
-  if (await sessionUser(who.id, { mayOpen: true })) {
-    return gwWriter(gwClient(who.id), users.arl(who.id) ? 'arl' : 'browser');
+  const session = await deezerSession(who, { mayOpen: true });
+  if (session.user) {
+    return gwWriter(gwClient(who), who.arl() ? 'arl' : 'browser');
   }
-  throw new HttpError(401, users.arl(who.id)
+  // Deezer's own complaint beats a guess about the cookie being stale.
+  if (session.error) throw session.error;
+  throw new HttpError(401, who.arl()
     ? 'That Deezer cookie is not a logged-in session any more - paste a fresh one.'
     : singleUser()
       ? 'Connect Deezer first (paste your session cookie, or open the browser login).'
@@ -310,18 +349,23 @@ app.get('/api/config', async (req, res) => {
       oauthUser: null,
       sessionUser: null,
       sessionMode: 'arl',
+      sessionError: null,
       sessionOpen: false,
       hasProfile: false,
       browserLogin: false,
       browserChannel: null,
     };
     if (who) {
-      deezer.oauthUser = oauthApi(who.id)?.user || null;
-      deezer.sessionUser = await sessionUser(who.id, { mayOpen: true });
+      deezer.oauthUser = oauthApi(who)?.user || null;
+      const session = await deezerSession(who, { mayOpen: true });
+      deezer.sessionUser = session.user;
+      // Reported rather than thrown: the rest of the page works without Deezer,
+      // and a page that will not load at all is worse than one saying "not now".
+      deezer.sessionError = session.error?.message || null;
       // The browser profile is a single machine-wide login, so it is only ever
       // offered when this server has one user by definition.
       deezer.browserLogin = singleUser();
-      deezer.sessionMode = users.arl(who.id) ? 'arl' : 'browser';
+      deezer.sessionMode = who.arl() ? 'arl' : 'browser';
       deezer.sessionOpen = singleUser() && browser.sessionOpen();
       deezer.hasProfile = singleUser() && browser.profileExists();
       deezer.browserChannel = singleUser() ? (browser.pickChannel() || 'chromium') : null;
@@ -335,6 +379,9 @@ app.get('/api/config', async (req, res) => {
           picture: who.identity.picture,
         } : null,
         restricted: auth.allowList().length > 0,
+        // Which store answered, for the debugging question "did my connection go
+        // somewhere else?". Told to people who are signed in, not to visitors.
+        store: who ? users.where() : null,
       },
       spotify: {
         mode: spotifyApi.configured() ? 'api' : 'public',
@@ -356,14 +403,15 @@ app.post('/api/deezer/session/open', async (req, res) => {
       throw new HttpError(409, 'This server has more than one user, so the shared browser login is off: '
         + 'paste your own Deezer session cookie instead.');
     }
-    if (users.arl(req.who.id)) {
-      const user = await sessionUser(req.who.id, { mayOpen: true });
+    if (req.who.arl()) {
+      const { user, error } = await deezerSession(req.who, { mayOpen: true });
+      if (error) throw error;
       if (!user) throw new HttpError(401, 'That Deezer cookie is not logged in.');
       return res.json({ user, opened: false });
     }
     // A stored login answers for itself headlessly; only a missing one is worth
     // putting a window on someone's screen for.
-    const known = await sessionUser(req.who.id, { mayOpen: true });
+    const known = (await deezerSession(req.who, { mayOpen: true })).user;
     if (known) return res.json({ user: known, opened: false });
 
     await browser.showPage(`${DEEZER_HOME}login`);
@@ -374,7 +422,8 @@ app.post('/api/deezer/session/open', async (req, res) => {
 app.get('/api/deezer/session/check', async (req, res) => {
   try {
     // Never opens or touches a window: the login in progress must be left alone.
-    res.set('Cache-Control', 'no-store').json({ user: await sessionUser(req.who.id) });
+    const { user, error } = await deezerSession(req.who);
+    res.set('Cache-Control', 'no-store').json({ user, error: error?.message || null });
   } catch (err) { fail(res, err); }
 });
 
@@ -398,8 +447,7 @@ app.post('/api/deezer/session/arl', async (req, res) => {
     const user = await probe.refresh();
     if (!user) throw new HttpError(401, 'That cookie is not a logged-in Deezer session - copy it again from a tab where you are signed in.');
 
-    users.setArl(req.who.id, value);
-    dropGwClient(req.who.id);
+    await req.who.setArl(value);
     if (singleUser()) await browser.closeSession();      // no window is needed any more
     res.json({ user });
   } catch (err) { fail(res, err); }
@@ -414,8 +462,7 @@ app.post('/api/deezer/session/close', async (req, res) => {
 
 app.post('/api/deezer/session/forget', async (req, res) => {
   try {
-    users.disconnect(req.who.id, 'arl');
-    dropGwClient(req.who.id);
+    await req.who.disconnect('arl');
     if (singleUser()) await browser.forgetSession();
     res.json({ ok: true });
   } catch (err) { fail(res, err); }
@@ -426,24 +473,32 @@ app.post('/api/deezer/session/forget', async (req, res) => {
 app.get('/api/deezer/login', (req, res) => {
   try {
     const state = crypto.randomBytes(16).toString('hex');
-    // The state remembers *which* signed-in user started this, so a callback can
-    // never file somebody else's Deezer account against the wrong record.
-    pendingStates.add(`${state}:${req.who.id}`);
-    setTimeout(() => pendingStates.delete(`${state}:${req.who.id}`), 10 * 60_000).unref?.();
+    // The state rides in a signed cookie, and remembers *which* signed-in user
+    // started this: a callback must not be able to file a Deezer account against
+    // somebody else's record, and in-process memory would not survive the second
+    // instance - or the cold start - that answers the callback.
+    sessions.setCookie(res, DEEZER_OAUTH_COOKIE, sessions.sign({ sub: state, uid: req.who.id, iat: Date.now() }), {
+      maxAgeMs: 10 * 60_000,
+      secure: secureCookies,
+    });
     res.redirect(deezerApi.authUrl({ port: PORT, state }));
   } catch (err) { fail(res, err); }
 });
 
 app.get('/api/deezer/callback', async (req, res) => {
   const { code, state, error_reason: denied } = req.query;
+  sessions.clearCookie(res, DEEZER_OAUTH_COOKIE, { secure: secureCookies });
   if (denied) return res.redirect('/?deezer=denied');
   if (!code) return res.redirect('/?deezer=error&message=' + encodeURIComponent('Deezer sent no code'));
-  if (!state || !pendingStates.delete(`${String(state)}:${req.who.id}`)) {
+
+  const jar = sessions.parseCookies(req.headers.cookie);
+  const pending = sessions.verify(jar[DEEZER_OAUTH_COOKIE], { maxAgeMs: 10 * 60_000 });
+  if (!state || !pending || pending.sub !== String(state) || pending.uid !== req.who.id) {
     return res.redirect('/?deezer=error&message=' + encodeURIComponent('Stale or forged callback state - try connecting again'));
   }
   try {
     const session = await deezerApi.exchangeCode(String(code), PORT);
-    users.setOauth(req.who.id, session);
+    await req.who.setOauth(session);
     res.redirect('/?deezer=connected');
   } catch (err) {
     res.redirect('/?deezer=error&message=' + encodeURIComponent(err.message));
@@ -452,7 +507,7 @@ app.get('/api/deezer/callback', async (req, res) => {
 
 app.post('/api/deezer/logout', async (req, res) => {
   try {
-    users.disconnect(req.who.id, 'oauth');
+    await req.who.disconnect('oauth');
     res.json({ ok: true });
   } catch (err) { fail(res, err); }
 });
@@ -581,32 +636,75 @@ app.post('/api/deezer/push', async (req, res) => {
 
 app.use(express.static(path.join(HERE, 'public'), { extensions: ['html'] }));
 
-if (singleUser()) users.migrateLegacy({ log: line => console.log(line) });
+/**
+ * The checks that are worth refusing to start over, rather than failing later on
+ * somebody's first sign-in.
+ */
+function preflight() {
+  const problems = [];
+  if (users.usingKv() && keyIsGenerated()) {
+    problems.push('APP_SECRET must be set when the records live in a key-value store: '
+      + 'a key generated per instance would sign everybody out on every cold start '
+      + 'and make the stored Deezer credentials unreadable.');
+  }
+  if (!singleUser() && !process.env.GOOGLE_CLIENT_SECRET) {
+    problems.push('GOOGLE_CLIENT_ID is set but GOOGLE_CLIENT_SECRET is not.');
+  }
+  return problems;
+}
 
-app.listen(PORT, () => {
-  console.log(`Spotify -> Deezer running on ${sessions.baseUrl(PORT)}  (build ${BUILD})`);
+function banner() {
+  console.log(`Spotify -> Deezer on ${sessions.baseUrl(PORT)}  (build ${BUILD})`);
   console.log(`   Sign-in: ${singleUser() ? 'off - single user, this machine' : 'Google'}`);
+  console.log(`   Records: ${users.where()}`);
   console.log(`   Spotify: ${spotifyApi.configured() ? 'app credentials (exact ISRC matching)' : 'no credentials - reading public pages'}`);
   console.log(`   Deezer:  ${deezerApi.configured() ? 'app credentials available' : 'per-user session cookie'}`);
-  if (!singleUser()) {
-    if (!auth.allowList().length) {
-      console.log('   ! ALLOWED_EMAILS is empty: anybody with a Google account can sign in and');
-      console.log('     connect their own Deezer. Set it to a list of addresses or @domains.');
-    }
-    if (keyIsGenerated()) {
-      console.log('   ! APP_SECRET is unset: sessions and stored Deezer cookies are keyed off');
-      console.log('     data/secret.key. Losing that file signs everybody out.');
-    }
-    if (!process.env.PUBLIC_URL && !process.env.BASE_URL) {
-      console.log(`   ! PUBLIC_URL is unset, so redirect URIs are built as ${sessions.baseUrl(PORT)}`);
-    }
+  if (singleUser()) return;
+  if (!auth.allowList().length) {
+    console.log('   ! ALLOWED_EMAILS is empty: anybody with a Google account can sign in and');
+    console.log('     connect their own Deezer. Set it to a list of addresses or @domains.');
   }
-});
-
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, async () => {
-    await flush();
-    await browser.closeSession();
-    process.exit(0);
-  });
+  if (keyIsGenerated()) {
+    console.log('   ! APP_SECRET is unset: sessions and stored Deezer credentials are keyed');
+    console.log('     off data/secret.key. Losing that file signs everybody out.');
+  }
+  if (!process.env.PUBLIC_URL && !process.env.BASE_URL) {
+    console.log(`   ! PUBLIC_URL is unset, so redirect URIs are built as ${sessions.baseUrl(PORT)}`);
+  }
+  if (!spotifyApi.configured() && !users.usingKv()) return;
+  if (!spotifyApi.configured()) {
+    console.log('   ! No Spotify credentials: playlists over 100 tracks are read by driving a');
+    console.log('     browser, which a serverless host cannot do. Set them there.');
+  }
 }
+
+const fatal = preflight();
+if (fatal.length) {
+  for (const line of fatal) console.error(`Refusing to start: ${line}`);
+  // On a serverless host there is nothing to exit from, so the app is still
+  // exported - every request will fail loudly on the same missing key.
+  if (!process.env.VERCEL) process.exit(1);
+}
+
+await users.migrateLegacy({ log: line => console.log(line) });
+
+/*
+ * Serverless hosts import this module and call the exported app themselves, one
+ * request at a time, so there is nothing to listen on and no signal to handle.
+ * Everything below is for the case where this process *is* the server.
+ */
+if (!process.env.VERCEL) {
+  app.listen(PORT, banner);
+
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, async () => {
+      await flush();
+      await browser.closeSession();
+      process.exit(0);
+    });
+  }
+} else {
+  banner();
+}
+
+export default app;

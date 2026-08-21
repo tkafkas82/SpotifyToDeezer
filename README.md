@@ -17,7 +17,7 @@ Deezer account — see [More than one user](#more-than-one-user).
 ```
 start.bat                 # installs, opens http://localhost:4870, runs the server
 npm start                 # same thing without the browser
-npm test                  # 46 offline tests
+npm test                  # 56 offline tests
 npm run probe             # match a sample track list against live Deezer
 ```
 
@@ -94,6 +94,54 @@ What changes:
 `DEEZER_ARL` in `.env` deliberately applies to the single-user mode only — one
 machine-wide cookie handed to whoever signs in is the same mistake as the shared
 browser profile.
+
+## Deploying it
+
+`data/users.json` assumes a disk that stays put. A serverless host has neither
+that nor a single instance, so setting `KV_REST_API_URL` and `KV_REST_API_TOKEN`
+moves the records into Redis over HTTP instead - the same two variables Vercel's
+Upstash integration fills in, and `UPSTASH_REDIS_REST_*` is read as well for a
+database made directly at Upstash. `lib/kv.js` is the whole client: a command is a
+JSON array in a POST body, so it adds no dependency and needs no connection to
+keep alive. One key per identity, holding the same encrypted record the file held.
+
+### On Vercel
+
+`vercel.json` and `api/index.js` are the deployment: every `/api/*` path goes to
+one function, the page itself comes off the CDN out of `public/`, and `server.js`
+skips `listen()` when `VERCEL` is set.
+
+Environment variables to set on the project:
+
+| | |
+| --- | --- |
+| `GOOGLE_CLIENT_ID` / `_SECRET` | sign-in, as above |
+| `ALLOWED_EMAILS` | who may sign in. On a public URL, do not leave this empty |
+| `APP_SECRET` | **required.** Any long random string. Without it a key would be generated per instance, which signs everyone out on every cold start and makes the stored Deezer credentials unreadable - the app refuses to start rather than do that |
+| `KV_REST_API_URL` / `_TOKEN` | from the KV integration; usually added for you |
+| `PUBLIC_URL` | `https://your-project.vercel.app`, so redirect URIs match and the session cookie is marked `Secure` |
+| `SPOTIFY_CLIENT_ID` / `_SECRET` | strongly recommended - see below |
+
+Then add the second redirect URI to the same Google client:
+`https://your-project.vercel.app/api/auth/google/callback`.
+
+Three things about a hosted deployment worth knowing before it surprises you:
+
+* **Preview deployments cannot sign in.** Each gets its own URL and Google permits
+  no wildcards in redirect URIs, so sign-in works on the production domain (or a
+  custom domain you attach) and previews fail with `redirect_uri_mismatch`.
+* **Playlists over 100 tracks need Spotify credentials there.** The keyless route
+  reads the tail by scrolling a real browser, and a function has no browser to
+  drive. With credentials there is no ceiling and no browser involved. The startup
+  banner says so when they are missing.
+* **A long conversion can outlive the function.** Matching is rate-limited by
+  Deezer - 200 tracks took 77 s locally - against a 60 s `maxDuration` in
+  `vercel.json` (raise it on a paid plan). The lookup cache cannot help either,
+  since it is a file: it works per instance and does not persist. Copying in
+  batches, or hosting somewhere with a disk, is the way round it for big playlists.
+
+Nothing about the single-user mode changes: with none of these set, the records
+stay in `data/users.json` and the browser routes keep working.
 
 ## How the keyless side works
 
@@ -197,6 +245,7 @@ server.js               Express routes, the auth gate, SSE conversion stream
 lib/auth.js             Google sign-in: authorization code flow, allow list
 lib/session.js          signed session cookies, and the origin the app answers on
 lib/users.js            one record per identity: profile + that person's Deezer
+lib/kv.js               those records in Redis over HTTP, for hosts with no disk
 lib/secret.js           the local key, and encryption of what lands on disk
 lib/paths.js            where the data directory is
 lib/spotify-public.js   keyless read: embed JSON, then browser scroll for >100
@@ -210,6 +259,7 @@ lib/convert.js          the fan-out over a playlist (6 lookups in flight)
 lib/store.js            disk cache of every ISRC/search answer
 lib/http.js             rate limiter + retrying JSON fetch
 public/                 the single-page UI
+api/index.js            the serverless entry point; vercel.json routes to it
 scripts/probe.js        match a track list from the command line
 ```
 

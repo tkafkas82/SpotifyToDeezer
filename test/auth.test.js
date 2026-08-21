@@ -2,13 +2,13 @@
  * The sign-in half, offline.
  *
  * Nothing here talks to Google: what is worth testing is the part that decides
- * who a request belongs to. A cookie that can be re-signed by hand, a record
- * store that hands one person's Deezer cookie to another, or an id_token accepted
- * because it merely parses - those are the failures that matter, and all three are
- * pure functions of local state.
+ * who a request belongs to. A cookie that can be re-signed by hand, a store that
+ * hands one person's Deezer cookie to another, or an id_token accepted because it
+ * merely parses - those are the failures that matter, and all three are pure
+ * functions of local state.
  *
- * SD_DATA_DIR points the store at a temp directory, and APP_SECRET is fixed so
- * the run does not depend on (or create) data/secret.key.
+ * SD_DATA_DIR points the file driver at a temp directory, and APP_SECRET is fixed
+ * so the run does not depend on (or create) data/secret.key.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,6 +20,10 @@ const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-users-'));
 process.env.SD_DATA_DIR = DIR;
 process.env.APP_SECRET = 'test-secret-not-a-real-one';
 delete process.env.DEEZER_ARL;
+// The file driver is what these exercise; the KV driver has its own test file.
+for (const key of ['KV_REST_API_URL', 'KV_REST_API_TOKEN', 'UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN', 'REDIS_REST_URL', 'REDIS_REST_TOKEN']) {
+  delete process.env[key];
+}
 
 const secret = await import('../lib/secret.js');
 const sessions = await import('../lib/session.js');
@@ -44,16 +48,17 @@ const idToken = payload => [
 
 // --- migration (first: it is the only test that expects an empty `local`) ---
 
-test('an existing single-user install keeps its Deezer connection', () => {
+test('an existing single-user install keeps its Deezer connection', async () => {
   fs.writeFileSync(path.join(DIR, 'gw.json'), JSON.stringify({ arl: 'a'.repeat(192) }));
   fs.writeFileSync(path.join(DIR, 'token.json'), JSON.stringify({
     accessToken: 'legacy-token', expiresAt: null, user: { id: 7, name: 'Old' },
   }));
 
-  users.migrateLegacy();
+  await users.migrateLegacy();
 
-  assert.equal(users.arl(users.LOCAL_ID), 'a'.repeat(192));
-  assert.equal(users.oauth(users.LOCAL_ID).accessToken, 'legacy-token');
+  const local = await users.load(users.LOCAL_ID);
+  assert.equal(local.arl(), 'a'.repeat(192));
+  assert.equal(local.oauth().accessToken, 'legacy-token');
   // The old files are gone, and what replaced them is not readable at a glance.
   assert.equal(fs.existsSync(path.join(DIR, 'gw.json')), false);
   assert.equal(fs.existsSync(path.join(DIR, 'token.json')), false);
@@ -66,7 +71,7 @@ test('a stored credential round-trips, and anything tampered with does not', () 
   const blob = secret.encrypt('an arl value');
   assert.equal(secret.decrypt(blob), 'an arl value');
 
-  const [v, iv, tag, body] = blob.split('.');
+  const [v, iv, tag] = blob.split('.');
   const flipped = [v, iv, tag, Buffer.from('different').toString('base64url')].join('.');
   assert.equal(secret.decrypt(flipped), null);      // GCM tag rejects it
   assert.equal(secret.decrypt('not a blob'), null);
@@ -166,56 +171,76 @@ test('the allow list accepts addresses and whole domains', () => {
 
 // --- the per-user store --------------------------------------------------
 
-test('each identity gets its own Deezer, and nobody can read another one', () => {
-  const a = users.googleId('111');
-  const b = users.googleId('222');
-  users.setArl(a, 'arl-of-a');
-  users.setArl(b, 'arl-of-b');
+test('each identity gets its own Deezer, and nobody can read another one', async () => {
+  const a = await users.load(users.googleId('111'));
+  const b = await users.load(users.googleId('222'));
+  await a.setArl('arl-of-a');
+  await b.setArl('arl-of-b');
 
-  assert.equal(users.arl(a), 'arl-of-a');
-  assert.equal(users.arl(b), 'arl-of-b');
-  assert.equal(users.arl(users.googleId('333')), null);        // never connected
+  assert.equal((await users.load(users.googleId('111'))).arl(), 'arl-of-a');
+  assert.equal((await users.load(users.googleId('222'))).arl(), 'arl-of-b');
+  assert.equal((await users.load(users.googleId('333'))).arl(), null);    // never connected
 
-  users.disconnect(a, 'arl');
-  assert.equal(users.arl(a), null);
-  assert.equal(users.arl(b), 'arl-of-b');                      // untouched
+  await (await users.load(users.googleId('111'))).disconnect('arl');
+  assert.equal((await users.load(users.googleId('111'))).arl(), null);
+  assert.equal((await users.load(users.googleId('222'))).arl(), 'arl-of-b');   // untouched
 });
 
-test('DEEZER_ARL in the environment belongs to the local user only', () => {
-  users.disconnect(users.LOCAL_ID, 'all');
+test('one account being written does not drop another written before it', async () => {
+  // Every save rewrites the whole file in the file driver, so this is the
+  // regression worth pinning: a read-modify-write that forgets the modify.
+  const ids = ['a1', 'a2', 'a3'].map(users.googleId);
+  for (const id of ids) await (await users.load(id)).setArl(`arl-${id}`);
+  for (const id of ids) assert.equal((await users.load(id)).arl(), `arl-${id}`);
+});
+
+test('DEEZER_ARL in the environment belongs to the local user only', async () => {
+  await (await users.load(users.LOCAL_ID)).disconnect('all');
   process.env.DEEZER_ARL = 'arl-from-env';
-  assert.equal(users.arl(users.LOCAL_ID), 'arl-from-env');
+  assert.equal((await users.load(users.LOCAL_ID)).arl(), 'arl-from-env');
   // Otherwise the first Google account to sign in would inherit the machine's session.
-  assert.equal(users.arl(users.googleId('444')), null);
+  assert.equal((await users.load(users.googleId('444'))).arl(), null);
   delete process.env.DEEZER_ARL;
 });
 
-test('an expired OAuth session reads as not connected', () => {
+test('the local identity needs no sign-in and is never written down', async () => {
+  const local = await users.load(users.LOCAL_ID);
+  assert.equal(local.identity.provider, 'local');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(DIR, 'users.json'), 'utf8')).users.local.identity, null);
+});
+
+test('an expired OAuth session reads as not connected', async () => {
   const id = users.googleId('555');
-  users.setOauth(id, { accessToken: 'live', expiresAt: null, user: { id: 1, name: 'A' } });
-  assert.equal(users.oauth(id).accessToken, 'live');
+  const account = await users.load(id);
+  await account.setOauth({ accessToken: 'live', expiresAt: null, user: { id: 1, name: 'A' } });
+  assert.equal((await users.load(id)).oauth().accessToken, 'live');
 
-  users.setOauth(id, { accessToken: 'stale', expiresAt: Date.now() - 1000, user: null });
-  assert.equal(users.oauth(id), null);
+  await account.setOauth({ accessToken: 'stale', expiresAt: Date.now() - 1000, user: null });
+  assert.equal((await users.load(id)).oauth(), null);
 
-  users.setOauth(id, null);
-  assert.equal(users.oauth(id), null);
+  await account.setOauth(null);
+  assert.equal((await users.load(id)).oauth(), null);
 });
 
-test('signing in remembers when it first happened', () => {
+test('signing in remembers when it first happened', async () => {
   const id = users.googleId('666');
-  const first = users.upsertIdentity(id, { provider: 'google', sub: '666', email: 'a@b.c', name: 'A' });
-  const again = users.upsertIdentity(id, { provider: 'google', sub: '666', email: 'a@b.c', name: 'A Renamed' });
-  assert.equal(again.firstSeen, first.firstSeen);
-  assert.equal(again.name, 'A Renamed');
-  assert.equal(users.get(id).identity.email, 'a@b.c');
+  const account = await users.load(id);
+  await account.signedIn({ provider: 'google', sub: '666', email: 'a@b.c', name: 'A' });
+  const first = account.identity.firstSeen;
+  await (await users.load(id)).signedIn({ provider: 'google', sub: '666', email: 'a@b.c', name: 'A Renamed' });
+
+  const reloaded = await users.load(id);
+  assert.equal(reloaded.identity.firstSeen, first);
+  assert.equal(reloaded.identity.name, 'A Renamed');
+  assert.equal(reloaded.email, 'a@b.c');
 });
 
-test('the store survives a reload of the file it just wrote', async () => {
+test('the file it writes is valid, versioned, and leaves no temp behind', () => {
   const onDisk = JSON.parse(fs.readFileSync(path.join(DIR, 'users.json'), 'utf8'));
   assert.equal(onDisk.version, 1);
   assert.ok(onDisk.users[users.googleId('222')].deezer.arl.startsWith('v1.'));
-  assert.equal(fs.existsSync(path.join(DIR, 'users.json.tmp')), false);   // renamed, not left behind
+  assert.equal(fs.existsSync(path.join(DIR, 'users.json.tmp')), false);
+  assert.equal(users.where(), 'data/users.json');
 });
 
 test.after(() => fs.rmSync(DIR, { recursive: true, force: true }));

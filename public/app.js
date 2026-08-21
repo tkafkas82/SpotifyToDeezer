@@ -130,6 +130,14 @@ async function loadConfig() {
     };
     box.append(drop);
     loadTargets();
+  } else if (dz.sessionError) {
+    // A stored cookie that Deezer would not answer for right now. Saying "not
+    // connected" here reads as "paste it again", which fixes nothing.
+    box.append(el('span', 'dot'), el('span', null, 'Deezer: no answer just now'));
+    box.append(el('span', 'muted', dz.sessionError));
+    const again = el('button', 'ghost', 'retry');
+    again.onclick = () => loadConfig();
+    box.append(again);
   } else {
     box.append(el('span', 'dot'), el('span', null, 'Deezer: not connected'));
     // The browser profile holds one machine-wide Deezer login, so the server only

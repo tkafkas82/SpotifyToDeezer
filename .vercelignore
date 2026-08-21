@@ -1,0 +1,8 @@
+# Local state has no business in a deployment: the records live in the key-value
+# store there, and the cache rebuilds itself.
+data/
+test/
+scripts/
+server.out
+server.err
+start.bat

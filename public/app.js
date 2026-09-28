@@ -298,8 +298,13 @@ function start() {
   resetRun();
   $('#go').disabled = true;
 
-  const es = new EventSource(`/api/convert?playlist=${encodeURIComponent(url)}`);
+  const src = `/api/convert?playlist=${encodeURIComponent(url)}`;
+  const es = new EventSource(src);
   const finish = () => { es.close(); $('#go').disabled = false; };
+  // An EventSource that never opened was answered with an ordinary error
+  // response, whose body it cannot read - so it has no way to say why.
+  let opened = false;
+  es.addEventListener('open', () => { opened = true; });
 
   es.addEventListener('loading', e => {
     const { loaded, total } = JSON.parse(e.data);
@@ -354,14 +359,36 @@ function start() {
     finish();
   });
 
-  es.addEventListener('error', e => {
-    // A payload means the server said why; a bare error means the stream dropped.
-    let message = 'The connection to the local server dropped';
+  es.addEventListener('error', async e => {
+    // A payload means the server said why; a bare error means the stream dropped,
+    // or never started.
+    let message = null;
     try { message = JSON.parse(e.data).message; } catch { /* transport-level */ }
-    $('#prog-text').textContent = 'Stopped';
-    toast(message, true);
     finish();
+    $('#prog-text').textContent = 'Stopped';
+    if (!message && !opened) message = await whyRefused(src);
+    toast(message || 'The connection to the server dropped', true);
   });
+}
+
+/**
+ * Ask the same URL again with fetch, which - unlike EventSource - can read an
+ * error response. Aborted as soon as it turns out to be a stream after all, so a
+ * request that would have worked this time does not run a whole conversion.
+ */
+async function whyRefused(src) {
+  const ac = new AbortController();
+  try {
+    const res = await fetch(src, { signal: ac.signal });
+    if ((res.headers.get('content-type') || '').includes('text/event-stream')) {
+      ac.abort();
+      return null;
+    }
+    const body = await res.json().catch(() => null);
+    return body?.error || `The server answered ${res.status}`;
+  } catch {
+    return 'Cannot reach the server - check the connection';
+  }
 }
 
 function buildRows(count) {

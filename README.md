@@ -238,6 +238,30 @@ Measured keyless, from a cold cache: *Top 50 Global* → 49 matched / 1 rejected
      asks before it does.
 4. **Export CSV** dumps the whole match table, including what was not found.
 
+## Growing a Deezer playlist
+
+**Grow a Deezer playlist** (the second tab) suggests songs to add to a playlist,
+based on the songs already in it. Paste a Deezer playlist link or pick one of yours,
+choose how many songs, and press **Suggest songs**.
+
+- Deezer has no "recommend for this playlist" call, but its gateway answers
+  **Track Mix** (the ~80 songs its own Mix button plays after a song) for any song,
+  even to a logged-out session. Up to 25 songs of the playlist, spread over the
+  whole of it, each ask for their mix.
+- A candidate ranks by how many of those songs lead to it, then by how early in
+  their mixes it comes. The row says which of your songs it is most like.
+- Nothing already in the playlist is suggested, and neither are other versions of
+  it (edit, live, remaster). No artist gets more than two slots (three above 30
+  songs) unless that would leave the list short.
+- ▶ plays Deezer's 30-second preview. **Different suggestions** leaves out
+  everything shown so far, versions included.
+- Your own playlist is appended to, skipping anything already in it. Anybody
+  else's cannot be changed, so it is saved as a new playlist of yours: its songs
+  first, then the chosen suggestions.
+
+Suggesting needs no Deezer connection; adding does. A private playlist can be read
+only through your own pasted cookie.
+
 ## Layout
 
 ```
@@ -256,6 +280,7 @@ lib/browser.js          Chrome/Edge/Chromium: headed login profile, headless scr
 lib/match.js            the strategy above, plus scoring
 lib/normalize.js        title/artist normalisation and Greek transliteration
 lib/convert.js          the fan-out over a playlist (6 lookups in flight)
+lib/grow.js             suggestions for a Deezer playlist from Track Mix
 lib/store.js            disk cache of every ISRC/search answer
 lib/http.js             rate limiter + retrying JSON fetch
 public/                 the single-page UI

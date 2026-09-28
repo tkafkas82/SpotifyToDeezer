@@ -205,6 +205,36 @@ footer#dock {
 .push-result { max-width: 1080px; margin: 0 auto; padding: 0 20px 12px; font-size: 14px; }
 .push-result a { color: var(--dz); }
 
+/* two jobs on one page: copying from Spotify, or growing a Deezer playlist */
+.modes { margin-bottom: 18px; }
+body:not(.mode-grow) .grow-only,
+body.mode-grow .copy-only,
+body.mode-grow footer#dock { display: none !important; }
+
+.sug {
+  display: grid;
+  grid-template-columns: 26px 34px 44px 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 4px;
+  border-top: 1px solid var(--line);
+}
+.sug:first-child { border-top: 0; }
+.sug input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--dz); }
+.sug img, .sug .nocover { width: 44px; height: 44px; border-radius: 6px; background: var(--panel-2); }
+.sug .meta { min-width: 0; }
+.sug .t, .sug .a, .sug .why { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sug .a { color: var(--muted); font-size: 13px; }
+.sug .why { color: var(--muted); font-size: 12px; opacity: .8; }
+.sug a { color: inherit; text-decoration: none; }
+.sug a:hover { text-decoration: underline; }
+.sug .play { width: 34px; height: 34px; padding: 0; border-radius: 50%; font-size: 12px; }
+.sug .play.on { border-color: var(--dz); color: var(--dz); }
+.sug .hits { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.grow-foot { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; margin-top: 14px; }
+.grow-foot input { flex: 1 1 260px; min-width: 0; }
+#grow-result { padding: 10px 0 0; }
+
 /* picker dialog */
 dialog {
   background: var(--panel);
@@ -240,6 +270,8 @@ dialog menu { display: flex; justify-content: flex-end; padding: 0; margin: 14px
 .toast.bad { border-color: var(--bad); color: #ffd9d9; }
 
 @media (max-width: 720px) {
+  .sug { grid-template-columns: 24px 34px 1fr; }
+  .sug img, .sug .nocover, .sug .hits { display: none; }
   .trk { grid-template-columns: 24px 1fr auto; }
   .trk .to { display: none; }
   .trk .side.dz { grid-column: 2 / 4; padding-left: 4px; border-left: 2px solid var(--line); }

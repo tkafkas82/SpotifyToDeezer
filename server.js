@@ -48,6 +48,7 @@ import * as sessions from './lib/session.js';
 import * as users from './lib/users.js';
 import { keyIsGenerated } from './lib/secret.js';
 import { convertPlaylist } from './lib/convert.js';
+import * as grow from './lib/grow.js';
 import { cache, flush } from './lib/store.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -568,6 +569,58 @@ app.get('/api/convert', async (req, res) => {
     clearInterval(beat);
     if (!closed) res.end();
   }
+});
+
+// --- grow a Deezer playlist ---------------------------------------------
+
+// Track Mix answers a logged-out visitor, so suggestions never need anyone's
+// session - one anonymous client serves every user who has not pasted a cookie.
+let anonGw = null;
+const anonymousGw = () => (anonGw ||= new GwClient(cookieTransport()));
+
+/**
+ * Songs to add to a Deezer playlist, based on what is already in it.
+ *
+ * The user's own cookie session is used when there is one: it can read their
+ * private playlists, and Deezer answers in their country, so the suggestions are
+ * ones they can actually play. Without one, public playlists still work.
+ */
+app.post('/api/grow/suggest', async (req, res) => {
+  try {
+    const { playlist, count, exclude } = req.body || {};
+    const id = await grow.resolvePlaylistId(playlist);
+    if (!id) throw new HttpError(400, 'That does not look like a Deezer playlist link');
+    const n = Math.min(100, Math.max(5, Number(count) || 25));
+
+    const own = req.who.arl() ? gwClient(req.who) : null;
+    const reader = own || anonymousGw();
+    const list = await grow.readPlaylist(id, { gw: own });
+    const result = await grow.suggest({
+      tracks: list.tracks,
+      count: n,
+      exclude: Array.isArray(exclude)
+        ? exclude.slice(0, 2000).map(x => (x && typeof x === 'object'
+          ? { id: String(x.id), title: String(x.title || ''), artists: (Array.isArray(x.artists) ? x.artists : []).map(String) }
+          : String(x)))
+        : [],
+      mix: seed => grow.trackMix(reader, seed.id),
+    });
+
+    // Whether it can be added to in place, or has to be saved as a copy. A lookup
+    // that fails just means "copy", which is the safe side to be wrong on.
+    let mine = false;
+    try {
+      const api = oauthApi(req.who);
+      const writable = api ? await api.myPlaylists() : own ? await own.myPlaylists() : [];
+      mine = writable.some(p => String(p.id) === id);
+    } catch { /* not connected, or Deezer did not answer */ }
+
+    const { tracks, ...meta } = list;
+    res.set('Cache-Control', 'no-store').json({
+      playlist: { ...meta, count: tracks.length, mine, trackIds: tracks.map(t => t.id) },
+      ...result,
+    });
+  } catch (err) { fail(res, err); }
 });
 
 // --- write to Deezer -----------------------------------------------------

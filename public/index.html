@@ -38,7 +38,12 @@
     <p class="hint" id="signin-note"></p>
   </section>
 
-  <section class="card" id="step-source">
+  <nav class="seg modes" id="modes">
+    <button type="button" data-mode="copy" class="chip on">Copy from Spotify</button>
+    <button type="button" data-mode="grow" class="chip">Grow a Deezer playlist</button>
+  </nav>
+
+  <section class="card copy-only" id="step-source">
     <label for="url">Spotify playlist link</label>
     <div class="row">
       <input id="url" type="text" spellcheck="false"
@@ -69,7 +74,51 @@
     <p class="hint" id="arl-browser-note"></p>
   </section>
 
-  <section class="card hidden" id="step-progress">
+  <section class="card grow-only" id="grow-source">
+    <label for="grow-url">Deezer playlist to grow</label>
+    <div class="row">
+      <input id="grow-url" type="text" spellcheck="false" autocomplete="off"
+             placeholder="https://www.deezer.com/playlist/...">
+      <select id="grow-mine" title="Or pick one of your own playlists">
+        <option value="">or one of yours&hellip;</option>
+      </select>
+      <select id="grow-count" title="How many songs to suggest">
+        <option value="10">10 songs</option>
+        <option value="25" selected>25 songs</option>
+        <option value="50">50 songs</option>
+        <option value="100">100 songs</option>
+      </select>
+      <button id="grow-go" class="primary">Suggest songs</button>
+    </div>
+    <p class="hint">
+      Asks Deezer&rsquo;s own <b>Track Mix</b> about up to 25 songs of the playlist and suggests
+      what most of them lead to &mdash; nothing that is already in it, and no more than a couple
+      of songs per artist. Nothing is added until you press the button under the list.
+    </p>
+  </section>
+
+  <section class="card grow-only hidden" id="grow-results">
+    <div class="results-head">
+      <div>
+        <strong id="grow-name">&nbsp;</strong>
+        <span class="muted" id="grow-meta"></span>
+      </div>
+      <div class="bulk">
+        <button id="grow-all" class="ghost">Select all</button>
+        <button id="grow-none" class="ghost">Select none</button>
+        <button id="grow-more" class="ghost" title="Leave these out and suggest others">Different suggestions</button>
+      </div>
+    </div>
+    <div id="grow-rows" class="rows"></div>
+    <div class="grow-foot">
+      <input id="grow-new-name" type="text" class="hidden" placeholder="Name of the new playlist">
+      <button id="grow-add" class="primary">Add to playlist</button>
+    </div>
+    <p class="hint" id="grow-hint"></p>
+    <div id="grow-result" class="push-result hidden"></div>
+  </section>
+
+  <section class="card copy-only hidden" id="step-progress">
     <div class="prog-head">
       <div>
         <strong id="pl-name">&nbsp;</strong>
@@ -81,7 +130,7 @@
     <div class="counts" id="counts"></div>
   </section>
 
-  <section class="card hidden" id="step-results">
+  <section class="card copy-only hidden" id="step-results">
     <div class="results-head">
       <div class="filters" id="filters">
         <button data-filter="all" class="chip on">All</button>

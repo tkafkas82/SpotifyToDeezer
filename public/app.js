@@ -34,6 +34,8 @@ const state = {
   dest: 'new',         // 'new' = copy into a fresh playlist, 'existing' = write into one
   writeMode: 'append', // only meaningful for 'existing': 'append' | 'replace'
   namedByHand: false,  // has the name box been typed into for this run?
+  mode: 'copy',        // 'copy' = Spotify -> Deezer, 'grow' = suggest songs for a Deezer playlist
+  grow: null,          // { source, playlist, rows: [{ track, selected, node }], shown: Map id -> track }
 };
 
 const mmss = ms => {
@@ -223,7 +225,13 @@ async function loadTargets() {
     sel.replaceChildren(new Option('Pick a playlist...', ''));
     for (const p of state.targets) sel.append(new Option(`${p.title} (${p.nbTracks})`, p.id));
     sel.value = keep;
+    const mine = $('#grow-mine');
+    const keepMine = mine.value;
+    mine.replaceChildren(new Option('or one of yours...', ''));
+    for (const p of state.targets) mine.append(new Option(`${p.title} (${p.nbTracks})`, p.id));
+    mine.value = keepMine;
     syncDest();
+    syncGrow();
   } catch { /* not connected yet - the dock stays on "new playlist" */ }
 }
 
@@ -606,6 +614,215 @@ function exportCsv() {
   URL.revokeObjectURL(a.href);
 }
 
+// --- grow a Deezer playlist ---------------------------------------------
+
+function setMode(mode) {
+  state.mode = mode === 'grow' ? 'grow' : 'copy';
+  document.body.classList.toggle('mode-grow', state.mode === 'grow');
+  [...$('#modes').children].forEach(b => b.classList.toggle('on', b.dataset.mode === state.mode));
+  if (state.mode !== 'grow') stopPreview();
+  try { localStorage.setItem('mode', state.mode); } catch { /* a convenience only */ }
+}
+
+// One preview plays at a time; starting another stops the first.
+const player = new Audio();
+let playingRow = null;
+function stopPreview() {
+  player.pause();
+  if (playingRow) playingRow.querySelector('.play')?.classList.remove('on');
+  playingRow = null;
+}
+player.addEventListener('ended', stopPreview);
+
+/**
+ * `more` asks for a fresh batch: everything already shown is left out, so the
+ * button is "show me others", not a reshuffle of the same list.
+ */
+async function growSuggest(more = false) {
+  const source = more ? state.grow?.source : ($('#grow-url').value.trim() || $('#grow-mine').value);
+  if (!source) return toast('Paste a Deezer playlist link, or pick one of yours', true);
+
+  const btn = more ? $('#grow-more') : $('#grow-go');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Asking Deezer...';
+  stopPreview();
+  try {
+    const shown = more ? state.grow.shown : new Map();
+    const res = await post('/api/grow/suggest', {
+      playlist: source,
+      count: Number($('#grow-count').value),
+      exclude: [...shown.values()].map(({ id, title, artists }) => ({ id, title, artists })),
+    });
+    if (res.error) throw new Error(res.error);
+    if (!res.suggestions.length) {
+      return toast(more ? 'No more suggestions for this playlist' : 'Deezer had nothing to suggest for this one', true);
+    }
+    res.suggestions.forEach(t => shown.set(t.id, t));
+    state.grow = {
+      source,
+      playlist: res.playlist,
+      shown,
+      rows: res.suggestions.map(track => ({ track, selected: true, node: null })),
+    };
+    renderGrow(res);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
+function renderGrow(res) {
+  const { playlist, rows } = state.grow;
+  $('#grow-name').textContent = playlist.title;
+  const bits = [playlist.creator, `${playlist.count} songs`, `${rows.length} suggestions from ${res.seeds} of them`];
+  if (res.failedSeeds) bits.push(`${res.failedSeeds} did not answer`);
+  $('#grow-meta').textContent = bits.filter(Boolean).join(' - ');
+  $('#grow-result').classList.add('hidden');
+
+  const frag = document.createDocumentFragment();
+  for (const row of rows) {
+    const t = row.track;
+    const n = el('div', 'sug');
+
+    const box = el('input');
+    box.type = 'checkbox';
+    box.checked = row.selected;
+    box.onchange = () => { row.selected = box.checked; syncGrow(); };
+
+    const play = el('button', 'play ghost', '▶');
+    play.type = 'button';
+    play.title = t.preview ? 'Play a 30-second preview' : 'No preview for this one';
+    play.disabled = !t.preview;
+    play.onclick = () => {
+      if (playingRow === n) return stopPreview();
+      stopPreview();
+      player.src = t.preview;
+      player.play().catch(() => toast('The preview would not play', true));
+      play.classList.add('on');
+      playingRow = n;
+    };
+
+    let cover;
+    if (t.cover) {
+      cover = el('img');
+      cover.src = t.cover;
+      cover.alt = '';
+      cover.loading = 'lazy';
+    } else {
+      cover = el('div', 'nocover');
+    }
+
+    const meta = el('div', 'meta');
+    const title = el('div', 't');
+    const a = el('a', null, t.title);
+    a.href = t.link;
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    title.append(a);
+    meta.append(
+      title,
+      el('div', 'a', `${t.artists.join(', ')} - ${mmss(t.durationMs)}`),
+      el('div', 'why', `like ${t.because.join(' and ')}${t.hits > t.because.length ? ` + ${t.hits - t.because.length} more` : ''}`),
+    );
+
+    const hits = el('div', 'hits', `${t.hits} of your songs`);
+    hits.title = "How many of the playlist's songs led to this one";
+
+    n.append(box, play, cover, meta, hits);
+    row.node = n;
+    frag.append(n);
+  }
+  $('#grow-rows').replaceChildren(frag);
+  $('#grow-results').classList.remove('hidden');
+
+  if (!playlist.mine) $('#grow-new-name').value = `${playlist.title} +`;
+  syncGrow();
+}
+
+/**
+ * Only the user's own playlist can be added to. Anybody else's is saved as a new
+ * playlist of theirs: the original songs first, then the chosen suggestions.
+ */
+function syncGrow() {
+  const g = state.grow;
+  if (!g) return;
+  const chosen = g.rows.filter(r => r.selected).length;
+  const mine = g.playlist.mine;
+  $('#grow-new-name').classList.toggle('hidden', mine);
+  const add = $('#grow-add');
+  add.textContent = mine
+    ? `Add ${chosen} song${chosen === 1 ? '' : 's'} to "${g.playlist.title}"`
+    : `Save as a new playlist with ${chosen} more`;
+  add.disabled = !chosen || !state.deezerReady;
+  $('#grow-hint').textContent = !state.deezerReady
+    ? 'Connect Deezer (above) to add these - suggesting works without it.'
+    : mine
+      ? 'Added to the end of the playlist; the songs in it stay where they are.'
+      : `"${g.playlist.title}" is not one of your playlists, so it cannot be changed - this makes a copy `
+        + `of its ${g.playlist.count} songs in your account, with the chosen suggestions after them.`;
+}
+
+async function growAdd() {
+  const g = state.grow;
+  const chosen = g?.rows.filter(r => r.selected).map(r => r.track.id) || [];
+  if (!chosen.length) return;
+  const mine = g.playlist.mine;
+  const title = $('#grow-new-name').value.trim() || `${g.playlist.title} +`;
+
+  const btn = $('#grow-add');
+  btn.disabled = true;
+  btn.textContent = 'Adding...';
+  try {
+    const res = await post('/api/deezer/push', mine
+      ? { trackIds: chosen, playlistId: g.playlist.id, mode: 'append' }
+      : {
+        trackIds: [...g.playlist.trackIds, ...chosen],
+        title,
+        description: `${g.playlist.title}, with songs suggested by Deezer's Track Mix`,
+      });
+    if (res.error) throw new Error(res.error);
+
+    const link = el('a', null, res.created ? `Open "${title}" on Deezer` : 'Open the playlist on Deezer');
+    link.href = res.link;
+    link.target = '_blank';
+    link.rel = 'noreferrer';
+    const summary = res.created
+      ? `Created "${title}" with ${res.added} songs, ${chosen.length} of them new`
+      : `Added ${res.added} song${res.added === 1 ? '' : 's'}`
+        + (res.duplicatesSkipped ? ` (${res.duplicatesSkipped} already there)` : '');
+    const box = $('#grow-result');
+    box.replaceChildren(el('span', null, summary), el('span', null, ' - '), link);
+    box.classList.remove('hidden');
+    toast(summary);
+
+    // What was just added is in the playlist now; it should not be offered again.
+    g.rows.filter(r => r.selected).forEach(r => r.node.remove());
+    g.rows = g.rows.filter(r => !r.selected);
+    // A copy is the user's own playlist from here on, so more suggestions go into it.
+    if (res.created) {
+      g.playlist = {
+        ...g.playlist,
+        id: String(res.playlistId),
+        title,
+        mine: true,
+        link: res.link,
+        trackIds: [...g.playlist.trackIds, ...chosen],
+      };
+      g.source = String(res.playlistId);
+      $('#grow-name').textContent = title;
+    }
+    loadTargets();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+    syncGrow();
+  }
+}
+
 // --- wiring --------------------------------------------------------------
 
 async function saveArl() {
@@ -653,6 +870,23 @@ $('#write-mode').onclick = e => {
   state.writeMode = btn.dataset.mode;
   syncDest();
 };
+$('#modes').onclick = e => {
+  const btn = e.target.closest('[data-mode]');
+  if (btn) setMode(btn.dataset.mode);
+};
+$('#grow-go').onclick = () => growSuggest(false);
+$('#grow-more').onclick = () => growSuggest(true);
+$('#grow-add').onclick = growAdd;
+$('#grow-url').addEventListener('keydown', e => { if (e.key === 'Enter') growSuggest(false); });
+// The two sources are either/or: picking one of yours clears a pasted link, and typing a link clears the pick.
+$('#grow-mine').onchange = () => { if ($('#grow-mine').value) $('#grow-url').value = ''; };
+$('#grow-url').addEventListener('input', () => { if ($('#grow-url').value) $('#grow-mine').value = ''; });
+const growSelect = on => {
+  state.grow?.rows.forEach(r => { r.selected = on; r.node.querySelector('input').checked = on; });
+  syncGrow();
+};
+$('#grow-all').onclick = () => growSelect(true);
+$('#grow-none').onclick = () => growSelect(false);
 $('#picker-search').onclick = pickerSearch;
 $('#picker-q').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); pickerSearch(); } });
 
@@ -686,5 +920,8 @@ if (params.get('auth') === 'denied') toast(params.get('message') || 'That Google
 if (params.get('auth') === 'error') toast(params.get('message') || 'Google sign-in failed', true);
 if (params.has('deezer') || params.has('auth')) history.replaceState({}, '', location.pathname);
 
+let savedMode = 'copy';
+try { savedMode = localStorage.getItem('mode') || 'copy'; } catch { /* private window */ }
+setMode(savedMode);
 loadConfig();
 syncDest();

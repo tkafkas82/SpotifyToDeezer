@@ -46,6 +46,7 @@ import * as browser from './lib/browser.js';
 import * as auth from './lib/auth.js';
 import * as sessions from './lib/session.js';
 import * as users from './lib/users.js';
+import * as kv from './lib/kv.js';
 import { keyIsGenerated } from './lib/secret.js';
 import { convertPlaylist } from './lib/convert.js';
 import * as grow from './lib/grow.js';
@@ -108,6 +109,7 @@ const OPEN_ROUTES = new Set([
   '/api/auth/google',
   '/api/auth/google/callback',
   '/api/auth/logout',
+  '/api/cron/keepalive',
 ]);
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
@@ -339,6 +341,26 @@ async function resolveWriter(who) {
 }
 
 const resolveReader = () => (spotifyApi.configured() ? spotifyApi : spotifyPublic);
+
+// --- keepalive ---------------------------------------------------------
+
+/*
+ * Vercel Cron (vercel.json) calls this once a day so the free Upstash database
+ * keeps seeing traffic and is not archived for inactivity. When CRON_SECRET is
+ * set, Vercel sends it as a bearer token and nothing else may trigger this.
+ */
+app.get('/api/cron/keepalive', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (secret && req.headers.authorization !== `Bearer ${secret}`) {
+    return res.status(401).json({ error: 'Not the scheduler.' });
+  }
+  if (!kv.configured()) return res.json({ ok: true, store: 'none' });
+  try {
+    res.set('Cache-Control', 'no-store').json({ ok: true, at: await kv.ping() });
+  } catch (err) {
+    fail(res, err);
+  }
+});
 
 // --- config --------------------------------------------------------------
 
